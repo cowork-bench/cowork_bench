@@ -8,7 +8,8 @@ Minimal delta vs harbor-native rc packaging:
   - agent-agnostic instruction (docs/task.md core only)
   - task.toml lists only mcp-gateway-public streamable-http URLs
   - dual gateway compose; no PG* on main
-  - workspace_lifecycle under tests/verifier only
+  - main finalize hook mounts only lifecycle modules at /opt/cowork_lifecycle
+  - evaluation/groundtruth stay under tests/ and are not mounted on main
   - solution/solve.sh Oracle for tasks with groundtruth_workspace
   - no Strands / ask_user / per-MCP HTTP rewrite
 """
@@ -20,6 +21,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import tarfile
 import textwrap
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +39,6 @@ from native_mcp.catalog import (  # noqa: E402
     split_servers,
 )
 from native_mcp.prep.db_rewrite import rewrite_preprocess_db_connections  # noqa: E402
-
 NATIVE_DIR = Path(__file__).resolve().parent / "native_mcp"
 PREP_SRC = NATIVE_DIR / "prep" / "prepare_workspace.py"
 
@@ -98,8 +99,83 @@ WORKSPACE_HINT = (
 )
 
 
-def _has_mock_http(source: Path) -> bool:
-    return (source / "files" / "mock_pages.tar.gz").is_file()
+
+def _instruction_localhost_port(instruction: str) -> int | None:
+    """Return the localhost port named by the agent instruction."""
+    match = re.search(r"localhost:(\d{2,5})", instruction)
+    return int(match.group(1)) if match else None
+
+
+def _preprocess_http_port(preprocess: str) -> int | None:
+    """Return the task HTTP port from preprocess, excluding PostgreSQL."""
+    for match in re.finditer(
+        r"(?im)^\s*(?:(?:MOCK_)?PORT|port)\s*=\s*(\d{2,5})\b",
+        preprocess,
+    ):
+        port = int(match.group(1))
+        if port != 5432:
+            return port
+    return None
+
+
+def _tar_top_directory(archive: Path) -> str:
+    """Return the real top-level payload directory, ignoring macOS metadata."""
+    with tarfile.open(archive, "r:gz") as handle:
+        roots = []
+        for member in handle.getmembers():
+            name = member.name
+            while name.startswith("./"):
+                name = name[2:]
+            if not name:
+                continue
+            root = name.split("/", 1)[0]
+            if root == "__MACOSX" or root.startswith("._"):
+                continue
+            if root not in roots:
+                roots.append(root)
+    if len(roots) != 1:
+        raise ValueError(f"{archive}: expected one payload root, got {roots}")
+    return roots[0]
+
+
+def _mock_http_spec(source: Path, instruction: str) -> dict | None:
+    """Derive the local HTTP fixture from task sources instead of a task list."""
+    preprocess_path = source / "preprocess" / "main.py"
+    if not preprocess_path.is_file():
+        return None
+    preprocess = preprocess_path.read_text(encoding="utf-8", errors="ignore")
+    if "http.server" not in preprocess and "HTTPServer" not in preprocess:
+        return None
+
+    port = _instruction_localhost_port(instruction) or _preprocess_http_port(preprocess)
+    if port is None:
+        raise ValueError(f"{source.name}: HTTP preprocess has no discoverable port")
+
+    candidates = (
+        Path("files/mock_pages.tar.gz"),
+        Path("files/mock_dashboard.tar.gz"),
+        Path("files/mock_pages"),
+        Path("tmp/mock_pages"),
+    )
+    asset = next((rel for rel in candidates if (source / rel).exists()), None)
+    if asset is None:
+        raise ValueError(f"{source.name}: HTTP preprocess has no fixture payload")
+
+    container_asset = f"/mock/{asset.name}"
+    spec = {
+        "port": port,
+        "volume": f"./task_payload/{asset.as_posix()}:{container_asset}:ro",
+        "extract": "",
+        "directory": container_asset,
+    }
+    if asset.name.endswith(".tar.gz"):
+        root = _tar_top_directory(source / asset)
+        spec["extract"] = (
+            "        mkdir -p /tmp/mock\n"
+            f"        tar -xzf {container_asset} -C /tmp/mock\n"
+        )
+        spec["directory"] = f"/tmp/mock/{root}"
+    return spec
 
 
 def _usable_groundtruth(source: Path) -> bool:
@@ -196,7 +272,7 @@ def _task_toml(task: str, servers: list[dict], *, has_db: bool) -> str:
 
             [[verifier.collect]]
             service = "main"
-            command = "PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py finalize"
+            command = "PYTHONPATH=/opt/cowork_lifecycle:/workspace /opt/venv/bin/python3 /opt/cowork_lifecycle/workspace_lifecycle.py finalize"
             timeout_sec = 60.0
 
             [agent]
@@ -253,30 +329,67 @@ def _compose(
     has_db: bool,
     has_db_gw: bool | None = None,
     has_workspace: bool,
-    has_mock: bool,
+    mock_http: dict | None,
 ) -> str:
     if has_db_gw is None:
         has_db_gw = has_db
-    mock_vol = (
-        "      - ./task_payload/files/mock_pages.tar.gz:/mock/mock_pages.tar.gz:ro\n"
-        if has_mock
-        else ""
-    )
-    if has_mock:
+    mock_vol = f"      - {mock_http['volume']}\n" if mock_http else ""
+    mock_pages_service = ""
+    if mock_http:
+        extract = mock_http["extract"]
+        serve_port = mock_http["port"]
+        serve_directory = mock_http["directory"]
         mock_cmd = (
             "    command:\n"
             "      - bash\n"
             "      - -lc\n"
             "      - |\n"
             "        set -euo pipefail\n"
-            "        mkdir -p /tmp/mock\n"
-            "        tar -xzf /mock/mock_pages.tar.gz -C /tmp/mock\n"
-            "        python3 -m http.server 30151 --bind 127.0.0.1 "
-            "--directory /tmp/mock/mock_pages >/tmp/mock-http.log 2>&1 &\n"
+            "        mkdir -p /logs/artifacts/cowork\n"
+            "        rm -f /logs/artifacts/cowork/traj_log.json"
+            " /logs/artifacts/cowork/agent_completion.json"
+            " /logs/artifacts/cowork/eval_res.json"
+            " /logs/artifacts/cowork/eval_report.json\n"
+            "        PYTHONPATH=/opt/cowork_lifecycle /opt/venv/bin/python3 -c "
+            "\"import workspace_lifecycle as w; w.discard_public_completion()\"\n"
+            f"{extract}"
+            f"        python3 -m http.server {serve_port} --bind 127.0.0.1 "
+            f"--directory {serve_directory} >/tmp/mock-http.log 2>&1 &\n"
             "        exec sleep infinity\n"
         )
+        gateway_service = "mcp-gateway-workspace" if has_workspace else "mcp-gateway-public"
+        mock_pages_service = f"""
+  mock-pages:
+    image: "{MAIN_IMAGE}"
+    network_mode: "service:{gateway_service}"
+    volumes:
+      - {mock_http['volume']}
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+{extract}        exec python3 -m http.server {serve_port} --bind 127.0.0.1 --directory {serve_directory}
+    depends_on:
+      {gateway_service}:
+        condition: service_started
+"""
     else:
-        mock_cmd = "    command:\n      - sleep\n      - infinity\n"
+        mock_cmd = (
+            "    command:\n"
+            "      - bash\n"
+            "      - -lc\n"
+            "      - |\n"
+            "        set -euo pipefail\n"
+            "        mkdir -p /logs/artifacts/cowork\n"
+            "        rm -f /logs/artifacts/cowork/traj_log.json"
+            " /logs/artifacts/cowork/agent_completion.json"
+            " /logs/artifacts/cowork/eval_res.json"
+            " /logs/artifacts/cowork/eval_report.json\n"
+            "        PYTHONPATH=/opt/cowork_lifecycle /opt/venv/bin/python3 -c "
+            "\"import workspace_lifecycle as w; w.discard_public_completion()\"\n"
+            "        exec sleep infinity\n"
+        )
 
     prep_network = "db_net" if has_db else "agent_net"
     prep_env_file = "    env_file:\n      - ./pg.env\n" if has_db else ""
@@ -495,7 +608,8 @@ services:
       UV_VENV_CLEAR: "1"
     volumes:
       - cowork_workspace:{SHARED_WS}
-{grader_main_vols}{mock_vol}      - ./agent_opt_stub:/opt/harbor_native:ro
+{grader_main_vols}{mock_vol}      - ./lifecycle:/opt/cowork_lifecycle:ro
+      - ./agent_opt_stub:/opt/harbor_native:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: "2g"
@@ -558,14 +672,37 @@ services:
       start_period: 20s
     depends_on:
 {public_depends_s}
-
+{mock_pages_service}
 volumes:
   cowork_workspace:
 {volumes_extra}"""
 
 
-_CLASSIFIER_PYTHON_SCRIPT = r"""import sys, os, json
+_CLASSIFIER_PYTHON_SCRIPT = r"""import sys, os, json, re
 from datetime import datetime, timezone
+
+def _grader_stdout_lines(text):
+    start_mark = "== Evaluation STDOUT =="
+    end_mark = "== Evaluation STDERR =="
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == start_mark and start is None:
+            start = index + 1
+        elif start is not None and line.strip() == end_mark:
+            return lines[start:index]
+    return None
+
+def _pass_verdicts(lines):
+    if not lines:
+        return []
+    pattern = re.compile(r"^Pass:[ \t]+(True|False)[ \t]*$")
+    found = []
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            found.append(match.group(1))
+    return found
 
 mode = sys.argv[1]
 try:
@@ -652,6 +789,19 @@ if mode == "oracle":
         err_msg = f"Evaluator exited with rc={eval_rc} without checks output"
 elif mode == "ua":
     traj_missing = "Cowork traj_log.json not found" in combined
+    found = _pass_verdicts(_grader_stdout_lines(stdout_txt))
+    if len(found) == 1:
+        explicit_verdict = found[0]
+        verdict_problem = None
+    elif len(found) > 1 and len(set(found)) == 1:
+        explicit_verdict = None
+        verdict_problem = "duplicate"
+    elif len(found) > 1:
+        explicit_verdict = None
+        verdict_problem = "conflict"
+    else:
+        explicit_verdict = None
+        verdict_problem = "missing"
     if traj_missing:
         status = "failed"
         tech_status = "error"
@@ -661,32 +811,48 @@ elif mode == "ua":
         err_msg = "Cowork traj_log.json not found"
     else:
         eval_res_data = None
+        eval_res_corrupt = False
         if os.path.isfile(eval_res_path):
             try:
                 with open(eval_res_path, "r", encoding="utf-8") as f:
                     eval_res_data = json.load(f)
             except Exception:
-                pass
-        if isinstance(eval_res_data, dict) and eval_res_data.get("pass") is True:
+                eval_res_corrupt = True
+        pass_value = eval_res_data.get("pass") if isinstance(eval_res_data, dict) else None
+        content_pass = (
+            eval_rc == 0
+            and explicit_verdict == "True"
+            and not has_traceback
+            and not syntax_or_import
+            and pass_value is True
+        )
+        content_fail = (
+            eval_rc == 1
+            and explicit_verdict == "False"
+            and not has_traceback
+            and not syntax_or_import
+            and pass_value is False
+        )
+        if content_pass:
             status = "succeeded"
             tech_status = "completed"
             reward = 1
             eval_completed = True
             err_type = None
             err_msg = None
-        elif isinstance(eval_res_data, dict) and eval_res_data.get("pass") is False:
+        elif content_fail:
             status = "succeeded"
             tech_status = "completed"
             reward = 0
             eval_completed = True
             err_type = None
             err_msg = "Content evaluation failed"
-        elif has_traceback:
+        elif has_traceback or syntax_or_import:
             status = "failed"
             tech_status = "error"
             reward = 0
             eval_completed = False
-            err_type = "python_traceback"
+            err_type = "python_traceback" if has_traceback else "syntax_or_import_error"
             tb_lines = [l.strip() for l in combined.splitlines() if l.strip()]
             err_msg = tb_lines[-1] if tb_lines else "run_eval traceback"
         else:
@@ -694,8 +860,17 @@ elif mode == "ua":
             tech_status = "error"
             reward = 0
             eval_completed = False
-            err_type = "eval_contract_fail"
-            err_msg = f"Invalid eval_res.json (rc={eval_rc})"
+            err_type = "evaluator_failure"
+            if eval_res_corrupt:
+                err_msg = f"corrupt evaluator output (rc={eval_rc})"
+            elif verdict_problem == "duplicate":
+                err_msg = f"duplicate Pass verdict (rc={eval_rc})"
+            elif verdict_problem == "conflict":
+                err_msg = f"conflicting Pass verdict (rc={eval_rc})"
+            elif explicit_verdict is None:
+                err_msg = f"missing explicit Pass verdict (rc={eval_rc})"
+            else:
+                err_msg = f"evaluator rc={eval_rc} does not match verdict {explicit_verdict}"
 
 record = {
     "version": "2.0.6",
@@ -739,6 +914,7 @@ def _verifier(task: str, *, has_db: bool) -> str:
             TASK={task!r}
             ROOT=/workspace/tasks/finalpool/$TASK
             mkdir -p /logs/verifier "$ROOT"
+            cd "${{COWORK_EVAL_ROOT:-/workspace}}"
 
             HANDOFF_DIR=/grader_out
             COMPLETION="$HANDOFF_DIR/completion.json"
@@ -778,18 +954,36 @@ def _verifier(task: str, *, has_db: bool) -> str:
                 set -e
               else
                 MODE="ua"
-                LOG=$(/opt/venv/bin/python3 -c "import glob; p=sorted(glob.glob('/logs/artifacts/cowork/**/traj_log.json',recursive=True)); print(p[0] if p else '')")
-                if [ -z "$LOG" ]; then
+                CONTRACT=/tests/grader_private/task_contract.json
+                PUBLIC=/logs/artifacts/cowork/agent_completion.json
+                LOG=/logs/artifacts/cowork/traj_log.json
+                rm -f "$LOG"
+                if [ ! -f "$CONTRACT" ] || [ ! -f "$PUBLIC" ]; then
                   printf '%s\n' "Cowork traj_log.json not found" >"$EVAL_STDERR"
                   : >"$EVAL_STDOUT"
                   EVAL_RC=2
                 else
-                  EVAL_RES="$(dirname "$LOG")/eval_res.json"
                   set +e
-                  PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
-                    --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
-                  EVAL_RC=$?
+                  PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py assemble \\
+                    --task "$TASK" --contract "$CONTRACT" --completion "$PUBLIC" --log "$LOG" \\
+                    >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+                  ASSEMBLE_RC=$?
                   set -e
+                  if [ "$ASSEMBLE_RC" -ne 0 ] || [ ! -f "$LOG" ]; then
+                    if [ ! -s "$EVAL_STDERR" ]; then
+                      printf '%s\n' "traj assemble failed" >"$EVAL_STDERR"
+                    fi
+                    EVAL_RC=2
+                  else
+                    EVAL_RES="$(dirname "$LOG")/eval_res.json"
+                    : >"$EVAL_STDOUT"
+                    : >"$EVAL_STDERR"
+                    set +e
+                    PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
+                      --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+                    EVAL_RC=$?
+                    set -e
+                  fi
                 fi
               fi
 
@@ -846,7 +1040,7 @@ PY
 
             if [ "$HANDOFF_STATUS" = "failed" ] || [ "$HANDOFF_TECH" = "error" ]; then
               echo "grader evaluator failed: error_type=$HANDOFF_ERR_TYPE message=$HANDOFF_ERR_MSG" >&2
-              echo 0 > /logs/verifier/reward.txt
+              rm -f /logs/verifier/reward.txt
               exit 2
             fi
 
@@ -869,13 +1063,10 @@ PY
         TASK={task!r}
         ROOT=/workspace/tasks/finalpool/$TASK
         mkdir -p /logs/verifier "$ROOT"
+        cd "${{COWORK_EVAL_ROOT:-/workspace}}"
 
-        # Lifecycle helpers arrive with Harbor's /tests upload (verifier phase only).
-        if [ -f /tests/verifier/workspace_lifecycle.py ] && [ -f {SHARED_WS}/.cowork/cli_context.json ]; then
-          PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py finalize \\
-            || true
-        fi
-
+        # Main already published the public completion record. /tests is mounted
+        # only for this verifier phase, after the agent has stopped.
         COMPLETION=/logs/verifier/completion.json
         REWARD_FILE=/logs/verifier/reward.txt
         EVAL_LOG=/logs/verifier/cowork-eval.log
@@ -910,18 +1101,36 @@ PY
           set -e
         else
           MODE="ua"
-          LOG=$(/opt/venv/bin/python3 -c "import glob; p=sorted(glob.glob('/logs/artifacts/cowork/**/traj_log.json',recursive=True)); print(p[0] if p else '')")
-          if [ -z "$LOG" ]; then
+          CONTRACT=/tests/grader_private/task_contract.json
+          PUBLIC=/logs/artifacts/cowork/agent_completion.json
+          LOG=/logs/artifacts/cowork/traj_log.json
+          rm -f "$LOG"
+          if [ ! -f "$CONTRACT" ] || [ ! -f "$PUBLIC" ]; then
             printf '%s\n' "Cowork traj_log.json not found" >"$EVAL_STDERR"
             : >"$EVAL_STDOUT"
             EVAL_RC=2
           else
-            EVAL_RES="$(dirname "$LOG")/eval_res.json"
             set +e
-            PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
-              --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
-            EVAL_RC=$?
+            PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py assemble \\
+              --task "$TASK" --contract "$CONTRACT" --completion "$PUBLIC" --log "$LOG" \\
+              >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+            ASSEMBLE_RC=$?
             set -e
+            if [ "$ASSEMBLE_RC" -ne 0 ] || [ ! -f "$LOG" ]; then
+              if [ ! -s "$EVAL_STDERR" ]; then
+                printf '%s\n' "traj assemble failed" >"$EVAL_STDERR"
+              fi
+              EVAL_RC=2
+            else
+              EVAL_RES="$(dirname "$LOG")/eval_res.json"
+              : >"$EVAL_STDOUT"
+              : >"$EVAL_STDERR"
+              set +e
+              PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
+                --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+              EVAL_RC=$?
+              set -e
+            fi
           fi
         fi
 
@@ -957,7 +1166,7 @@ PY
 
         if [ "$HANDOFF_STATUS" = "failed" ] || [ "$HANDOFF_TECH" = "error" ]; then
           echo "evaluator failed: error_type=$HANDOFF_ERR_TYPE message=$HANDOFF_ERR_MSG" >&2
-          echo 0 > /logs/verifier/reward.txt
+          rm -f "$REWARD_FILE"
           exit 2
         fi
 
@@ -995,19 +1204,33 @@ def _solve_sh(task: str) -> str:
         from datetime import datetime
         from pathlib import Path
         ws = Path({SHARED_WS!r})
+        task_config = {{
+          "task_dir": {task!r},
+          "id": {task!r},
+          "needed_mcp_servers": None,
+          "needed_local_tools": None,
+          "task_root": {task!r},
+          "task_str": "",
+          "log_file": "/logs/artifacts/cowork/traj_log.json",
+          "agent_workspace": str(ws),
+          "launch_time": "",
+          "max_turns": None,
+          "max_steps_under_single_turn_mode": None,
+          "single_turn_mode": True,
+          "cn_mode": False,
+          "system_prompts": {{"agent": None, "user": None}},
+          "initialization": {{"workspace": None, "process_command": None}},
+          "stop": {{"user_phrases": ["#### STOP"], "tool_names": ["local-claim_done"]}},
+          "evaluation": {{"groundtruth_workspace": None, "evaluation_command": None}},
+          "meta": {{}},
+          "local_token_key_session": None,
+        }}
         ctx = {{
-          "task": {task!r},
+          "task": task_config.get("task_dir"),
           "provider": "oracle",
           "model": "solve.sh",
           "workspace": str(ws),
           "log_file": "/logs/artifacts/cowork/traj_log.json",
-          "task_config": {{
-            "id": {task!r},
-            "task_dir": {task!r},
-            "agent_workspace": str(ws),
-            "log_file": "/logs/artifacts/cowork/traj_log.json",
-            "single_turn_mode": True,
-          }},
           "start_time": datetime.now().isoformat(),
         }}
         (ws / ".cowork").mkdir(parents=True, exist_ok=True)
@@ -1015,11 +1238,11 @@ def _solve_sh(task: str) -> str:
         Path("/logs/artifacts/cowork").mkdir(parents=True, exist_ok=True)
         Path("/logs/artifacts/cowork/traj_log.json").write_text(
           json.dumps({{
-            "config": ctx["task_config"],
+            "config": task_config,
             "status": "success",
             "start_time": ctx["start_time"],
             "end_time": datetime.now().isoformat(),
-            "completion": {{"confirmed": True, "reason": "oracle_solve_sh", "framework": "oracle", "evidence": ["solution/solve.sh"]}},
+            "completion": {{"confirmed": True, "reason": "oracle_solve_sh", "framework": "oracle", "evidence": ["solution/solve.sh"], "stop_reason": None}},
           }}, ensure_ascii=False, indent=2),
           encoding="utf-8",
         )
@@ -1115,7 +1338,6 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     has_workspace = bool(ws_servers)
     if not has_db and not has_workspace:
         has_workspace = True
-    has_mock = _has_mock_http(source)
     has_gt = (
         _usable_groundtruth(source)
         and task not in NO_GROUNDTRUTH
@@ -1129,6 +1351,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     (env_dir / "mcp_runtime").mkdir(parents=True)
     (env_dir / "prep").mkdir(parents=True)
     (env_dir / "agent_opt_stub").mkdir(parents=True)
+    (env_dir / "lifecycle").mkdir(parents=True)
     (env_dir / "task_payload").mkdir(parents=True)
     (target / "tests" / "verifier").mkdir(parents=True)
     (target / "solution").mkdir(parents=True)
@@ -1137,6 +1360,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         encoding="utf-8"
     ).rstrip() + "\n"
     instruction = instruction + WORKSPACE_HINT
+    mock_http = _mock_http_spec(source, instruction)
     for banned in (
         "TURN_FINISHED",
         "turn_finish",
@@ -1160,7 +1384,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
             has_db=has_db,
             has_db_gw=has_db_gw,
             has_workspace=has_workspace,
-            has_mock=has_mock,
+            mock_http=mock_http,
         ),
         encoding="utf-8",
     )
@@ -1225,7 +1449,9 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
 
     (env_dir / "agent_opt_stub" / "README.md").write_text(
         "Stub mount for /opt/harbor_native on main.\n"
-        "Lifecycle lives under tests/verifier only — not agent-visible.\n",
+        "The main finalize hook mounts only workspace_lifecycle.py and\n"
+        "completion.py at /opt/cowork_lifecycle. Evaluation paths are not\n"
+        "written before the agent stops.\n",
         encoding="utf-8",
     )
     shutil.copy2(PREP_SRC, env_dir / "prep" / "prepare_workspace.py")
@@ -1251,7 +1477,22 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
     for name in ("workspace_lifecycle.py", "completion.py"):
+        shutil.copy2(NATIVE_DIR / name, env_dir / "lifecycle" / name)
         shutil.copy2(NATIVE_DIR / name, target / "tests" / "verifier" / name)
+    shutil.copy2(NATIVE_DIR / "verifier_shell.py", target / "tests" / "verifier" / "verifier_shell.py")
+    from native_mcp.verifier_shell import sanitized_task_config
+
+    contract = sanitized_task_config(
+        task,
+        agent_workspace=SHARED_WS,
+        log_file="/logs/artifacts/cowork/traj_log.json",
+    )
+    private_dir = target / "tests" / "grader_private"
+    private_dir.mkdir(parents=True, exist_ok=True)
+    (private_dir / "task_contract.json").write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     _copy_payload(source, env_dir / "task_payload")
     preprocess_dir = env_dir / "task_payload" / "preprocess"
@@ -1283,7 +1524,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         or "clickhouse" in task,
         "hr1c": "hr1c" in mcp_names or "hr1c" in task,
         "multi_workspace": len(ws_servers) >= 2,
-        "has_mock_http": has_mock,
+        "has_mock_http": mock_http is not None,
     }
     summary = {
         "source_task": task,

@@ -29,13 +29,20 @@ def _ctx(workspace: Path, log_file: Path) -> None:
         json.dumps(
             {
                 "task": "demo",
+                "provider": "harbor-canonical",
+                "model": "n/a",
+                "workspace": str(workspace),
                 "log_file": str(log_file),
-                "task_config": {"agent_workspace": str(workspace)},
                 "start_time": "t0",
             }
         ),
         encoding="utf-8",
     )
+
+
+def _public(log_file: Path) -> dict:
+    del log_file
+    return json.loads(wl.AGENT_COMPLETION_PATH.read_text(encoding="utf-8"))
 
 
 class CompletionInferenceTests(unittest.TestCase):
@@ -154,8 +161,45 @@ class CompletionInferenceTests(unittest.TestCase):
         self.assertTrue(got.confirmed)
         self.assertEqual(got.reason, "workspace_turn_finished_marker")
 
+    def test_strands_end_turn_is_success_and_keeps_stop_reason(self) -> None:
+        d = _agent_dir()
+        (d / "strands-events.jsonl").write_text(
+            json.dumps({"kind": "message", "sequence": 1}) + "\n",
+            encoding="utf-8",
+        )
+        (d / "strands-result.json").write_text(
+            json.dumps({"stop_reason": "end_turn", "error": None, "output": "hidden"}),
+            encoding="utf-8",
+        )
+        got = infer_completion(d)
+        self.assertTrue(got.confirmed)
+        self.assertEqual(got.framework, "strands")
+        self.assertEqual(got.reason, "strands_stop_reason")
+        self.assertEqual(got.stop_reason, "end_turn")
+        self.assertEqual(got.cowork_status, "success")
+
+    def test_strands_max_tokens_is_not_success_but_stop_reason_is_kept(self) -> None:
+        d = _agent_dir()
+        (d / "strands-result.json").write_text(
+            json.dumps({"stop_reason": "max_tokens", "error": None}),
+            encoding="utf-8",
+        )
+        got = infer_completion(d)
+        self.assertFalse(got.confirmed)
+        self.assertEqual(got.stop_reason, "max_tokens")
+        self.assertEqual(got.cowork_status, "failed")
+        self.assertEqual(got.reason, "strands_not_success")
+
 
 class FinalizeContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.artifacts = Path(tempfile.mkdtemp(prefix="cowork-artifacts-"))
+        self._previous_completion = wl.AGENT_COMPLETION_PATH
+        wl.AGENT_COMPLETION_PATH = self.artifacts / "agent_completion.json"
+
+    def tearDown(self) -> None:
+        wl.AGENT_COMPLETION_PATH = self._previous_completion
+
     def test_finalize_does_not_default_to_success(self) -> None:
         ws = Path(tempfile.mkdtemp(prefix="cowork-fin-"))
         log = ws / "traj_log.json"
@@ -168,10 +212,13 @@ class FinalizeContractTests(unittest.TestCase):
             agent_dir=agent,
             context_path=ws / ".cowork" / "cli_context.json",
         )
-        self.assertEqual(result["status"], "FAILED")
-        dumped = json.loads(log.read_text(encoding="utf-8"))
-        self.assertEqual(dumped["status"], "FAILED")
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(log.exists())
+        dumped = _public(log)
+        self.assertEqual(dumped["status"], "failed")
+        self.assertNotIn("config", dumped)
         self.assertNotEqual(dumped["status"], "SUCCESS")
+        self.assertNotIn(dumped["status"], {"SUCCESS", "FAILED"})
 
     def test_finalize_writes_success_only_when_inferred(self) -> None:
         ws = Path(tempfile.mkdtemp(prefix="cowork-ok-"))
@@ -188,10 +235,13 @@ class FinalizeContractTests(unittest.TestCase):
             agent_dir=agent,
             context_path=ws / ".cowork" / "cli_context.json",
         )
-        self.assertEqual(result["status"], "SUCCESS")
-        dumped = json.loads(log.read_text(encoding="utf-8"))
-        self.assertEqual(dumped["status"], "SUCCESS")
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(log.exists())
+        dumped = _public(log)
+        self.assertEqual(dumped["status"], "success")
+        self.assertNotIn("config", dumped)
         self.assertIn("completion", dumped)
+        self.assertIn("stop_reason", dumped["completion"])
 
 
 if __name__ == "__main__":

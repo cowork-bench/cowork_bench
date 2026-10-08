@@ -22,12 +22,17 @@ from generate_harbor_canonical import (  # noqa: E402
 )
 
 
+def _grader_region(body: str) -> str:
+    text = body if body.endswith("\n") or body == "" else body + "\n"
+    return "== Evaluation STDOUT ==\n" + text + "== Evaluation STDERR ==\n"
+
+
 class GraderIsolationTests(unittest.TestCase):
     """Regression tests for DB grader sidecar isolation and handoff verification."""
 
     def test_db_compose_has_grader_on_db_net_only(self) -> None:
         """Verify DB docker-compose attaches grader exclusively to db_net and main mounts grader_out read-only."""
-        yml = _compose("demo-task", has_db=True, has_workspace=True, has_mock=False)
+        yml = _compose("demo-task", has_db=True, has_workspace=True, mock_http=None)
         self.assertIn("grader:", yml)
         self.assertIn("grader_out:/grader_out:ro", yml)
         # main networks block should not list db_net as a main attachment.
@@ -42,7 +47,7 @@ class GraderIsolationTests(unittest.TestCase):
 
     def test_no_db_compose_omits_grader(self) -> None:
         """Verify non-DB docker-compose does not include grader sidecar."""
-        yml = _compose("demo-task", has_db=False, has_workspace=True, has_mock=False)
+        yml = _compose("demo-task", has_db=False, has_workspace=True, mock_http=None)
         self.assertNotIn("grader:", yml)
         self.assertNotIn("grader_out", yml)
 
@@ -51,8 +56,36 @@ class GraderIsolationTests(unittest.TestCase):
         toml = _task_toml("demo-task", [{"name": "emails"}], has_db=True)
         self.assertIn('service = "grader"', toml)
         self.assertIn("bash /tests/test.sh", toml)
+        self.assertIn(
+            "/opt/cowork_lifecycle/workspace_lifecycle.py finalize",
+            toml,
+        )
+        self.assertNotIn("/tests/verifier/workspace_lifecycle.py", toml)
         toml2 = _task_toml("demo-task", [{"name": "excel"}], has_db=False)
         self.assertNotIn('service = "grader"', toml2)
+        self.assertIn(
+            "/opt/cowork_lifecycle/workspace_lifecycle.py finalize",
+            toml2,
+        )
+
+    def test_main_mounts_lifecycle_modules_not_tests(self) -> None:
+        """Finalize runs on main, which must see lifecycle modules and not tests/."""
+        for has_db in (True, False):
+            yml = _compose(
+                "demo-task",
+                has_db=has_db,
+                has_workspace=True,
+                mock_http=None,
+            )
+            main = yml.split("\n  workspace-prep:")[0]
+            self.assertIn("./lifecycle:/opt/cowork_lifecycle:ro", main)
+            self.assertNotIn("../tests:", main)
+        db = _compose("demo-task", has_db=True, has_workspace=True, mock_http=None)
+        grader = db.split("\n  grader:")[1].split("mcp-gateway-public:")[0]
+        self.assertIn("../tests:/tests:ro", grader)
+        file_only = _verifier("demo-task", has_db=False)
+        self.assertIn("Cowork traj_log.json not found", file_only)
+        self.assertIn("traj_log.json", file_only)
 
     def test_verifier_handoff_and_grader_publish(self) -> None:
         """Verify verifier script contains handoff logic and syntax check passes."""
@@ -225,24 +258,54 @@ class CompletionContractClassifierTests(unittest.TestCase):
         self.assertEqual(reward, "0")
 
     def test_ua_pass_true_reward1(self) -> None:
-        """UA mode: eval_res.json has pass: true -> reward 1."""
+        """UA content pass requires rc 0, Pass: True, and eval_res pass true."""
         comp, reward = self._run_classifier(
-            "ua", 0, "run_eval done", "", eval_res_data={"pass": True}
+            "ua", 0, _grader_region("Pass:    True\n"), "", eval_res_data={"pass": True}
         )
         self.assertEqual(comp["status"], "succeeded")
         self.assertEqual(comp["technical_status"], "completed")
         self.assertEqual(comp["reward"], 1)
+        self.assertTrue(comp["evaluator_completed"])
+        self.assertIsNone(comp["error_type"])
         self.assertEqual(reward, "1")
 
     def test_ua_pass_false_reward0(self) -> None:
-        """UA mode: eval_res.json has pass: false -> reward 0."""
+        """UA content fail requires rc 1 and an explicit Pass: False verdict."""
         comp, reward = self._run_classifier(
-            "ua", 0, "run_eval done", "", eval_res_data={"pass": False}
+            "ua", 1, _grader_region("Pass:    False\n"), "", eval_res_data={"pass": False}
         )
         self.assertEqual(comp["status"], "succeeded")
         self.assertEqual(comp["technical_status"], "completed")
         self.assertEqual(comp["reward"], 0)
+        self.assertTrue(comp["evaluator_completed"])
+        self.assertIsNone(comp["error_type"])
+        self.assertEqual(comp["error_message"], "Content evaluation failed")
         self.assertEqual(reward, "0")
+
+    def test_ua_rc1_without_pass_false_is_evaluator_failure(self) -> None:
+        comp, reward = self._run_classifier(
+            "ua", 1, "run_eval crashed\n", "", eval_res_data={"pass": False}
+        )
+        self.assertEqual(comp["status"], "failed")
+        self.assertEqual(comp["technical_status"], "error")
+        self.assertFalse(comp["evaluator_completed"])
+        self.assertEqual(comp["error_type"], "evaluator_failure")
+        self.assertNotEqual(comp["error_message"], "Content evaluation failed")
+        self.assertIsNone(reward)
+
+    def test_ua_traceback_is_not_content_fail(self) -> None:
+        stderr = "Traceback (most recent call last):\nRuntimeError: boom\n"
+        comp, reward = self._run_classifier(
+            "ua",
+            1,
+            _grader_region("Pass:    False\n"),
+            stderr,
+            eval_res_data={"pass": False},
+        )
+        self.assertEqual(comp["technical_status"], "error")
+        self.assertEqual(comp["error_type"], "python_traceback")
+        self.assertFalse(comp["evaluator_completed"])
+        self.assertIsNone(reward)
 
     def test_ua_missing_traj_log(self) -> None:
         """UA mode: missing traj_log.json produces error."""
