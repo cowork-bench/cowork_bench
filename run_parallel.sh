@@ -405,8 +405,8 @@ conn.close()
 
     # Only this fresh attempt's native artifacts determine the verdict.
     # No shared dumps search, platform-specific stat or streamed-text fallback.
-    local STATUS="unknown" EVAL_PASS="null"
-    read -r STATUS EVAL_PASS < <(python3 scripts/read_attempt_result.py "$ATTEMPT_DIR" "$TASK" ${TIMED_OUT[@]+"${TIMED_OUT[@]}"})
+    local STATUS="evaluation_error" EVAL_PASS="null"
+    read -r STATUS EVAL_PASS < <(python3 scripts/read_attempt_result.py "$ATTEMPT_DIR" "$TASK" --agent-exit "$AGENT_EXIT" ${TIMED_OUT[@]+"${TIMED_OUT[@]}"}) || { STATUS="evaluation_error"; EVAL_PASS="null"; }
 
     append_summary "${TASK},${STATUS},${EVAL_PASS},${DURATION}"
 
@@ -467,6 +467,11 @@ import sys, csv, json, os
 
 summary_file = sys.argv[1]
 log_dir = sys.argv[2]
+try:
+    with open(os.path.join(log_dir, "run_meta.json")) as f:
+        m = json.load(f)
+except (OSError, ValueError):
+    m = {}
 pass_count = eval_fail = agent_fail = other = eval_error = 0
 total_duration = 0
 results = []
@@ -502,12 +507,14 @@ for task, label, dur in sorted(results):
     print(f"  {task:<55s} {label:<12s} ({dur}s)")
 
 total = pass_count + eval_fail + agent_fail + other + eval_error
+coverage_complete = total == m.get("total_tasks") and len({r[0] for r in results}) == total
+print(f"Coverage: {total}/{m.get('total_tasks', 'unknown')}")
 print(f"Evaluation errors (unscored): {eval_error}")
 print()
 if total > 0:
     print(f"  PASS:       {pass_count:4d}")
-    if other or eval_error:
-        print("  Benchmark score: unavailable (unscored infrastructure/evaluation errors)")
+    if other or eval_error or not coverage_complete:
+        print("  Benchmark score: unavailable (unscored errors or incomplete coverage)")
     else:
         print(f"  Benchmark score: {100*pass_count/total:.1f}%")
     print(f"  EVAL_FAIL:  {eval_fail:4d}  ({100*eval_fail/total:.1f}%)")
@@ -520,13 +527,8 @@ else:
     print("  No results.")
 
 # Append aggregate to central index (one row per run; params from run_meta.json)
-try:
-    with open(os.path.join(log_dir, "run_meta.json")) as f:
-        m = json.load(f)
-except (OSError, ValueError):
-    m = {}
 llm = m.get("llm", {})
-pass_pct = round(100 * pass_count / total, 1) if total and not (other or eval_error) else ""
+pass_pct = round(100 * pass_count / total, 1) if total and coverage_complete and not (other or eval_error) else ""
 index = os.path.join(os.path.dirname(log_dir) or ".", "index.csv")
 cols = ["timestamp", "model", "model_quant", "reasoning_effort", "max_concurrent",
         "total", "pass", "pass_pct", "eval_fail", "agent_fail", "other",

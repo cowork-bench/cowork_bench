@@ -14,6 +14,7 @@ from pptx import Presentation
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from utils.evaluation.spreadsheets import load_calculated_workbook
+from utils.evaluation.artifact_guards import require_files
 
 def num_close(a, b, tol=1.0):
     if a is None and b is None:
@@ -39,29 +40,67 @@ def load_sheet_rows(wb, sheet_name):
     return None
 
 
-def slide_text(slide):
-    text = []
+def slide_records(slide):
+    """Keep visible labels and values associated across text, tables and charts."""
+    records, single_lines = [], []
     for shape in slide.shapes:
         if shape.has_text_frame:
-            text.append(shape.text)
+            lines = [line.strip() for line in shape.text.splitlines() if line.strip()]
+            records.extend(lines)
+            if len(lines) == 1:
+                single_lines.append((shape, lines[0]))
         if shape.has_table:
-            text.extend(cell.text for row in shape.table.rows for cell in row.cells)
+            records.extend(" | ".join(cell.text for cell in row.cells) for row in shape.table.rows)
         if shape.has_chart:
             chart = shape.chart
-            text.extend(str(category.label) for category in chart.plots[0].categories)
+            categories = [str(category.label) for category in chart.plots[0].categories]
             for series in chart.series:
-                values = [value for value in series.values if value is not None]
-                text.extend(str(value) for value in values)
-                if (values and sum(values) and any(plot.has_data_labels and
-                        plot.data_labels.show_percentage for plot in chart.plots)):
-                    text.extend(str(round(value / sum(values) * 100, 1)) for value in values)
-    return " ".join(text).lower()
+                values = list(series.values)
+                total = sum(value for value in values if value is not None)
+                percentages = any(plot.has_data_labels and plot.data_labels.show_percentage
+                                  for plot in chart.plots)
+                for category, value in zip(categories, values):
+                    record = f"{category}: {value}"
+                    if percentages and total and value is not None:
+                        record += f" ({round(value / total * 100, 1)}%)"
+                    records.append(record)
+    # Slide tools can put labels, codes and values in separate text boxes.
+    # Join a visual row, never text from unrelated rows elsewhere on the slide.
+    for shape, _ in single_lines:
+        aligned = [(other.left, text) for other, text in single_lines
+                   if abs(other.top - shape.top) <= 914400 * 0.15]
+        if len(aligned) > 1:
+            records.append(" | ".join(text for _, text in sorted(aligned)))
+    return [record.casefold() for record in records]
 
 
-def has_number(text, expected, tolerance=0.05):
-    text = re.sub(r"(?<=\d)[ \u00a0](?=\d{3}\b)", "", text)
-    return any(num_close(value.replace(",", "."), expected, tolerance)
-               for value in re.findall(r"\d+(?:[.,]\d+)?", text))
+def has_number(text, expected, tolerance=0.005):
+    # English thousands separators, decimal commas and nonbreaking spaces are
+    # presentation choices. Preserve signs: -22 is not an acceptable count of 22.
+    pattern = r"(?<![\w.])[+-]?(?:\d{1,3}(?:[, \u00a0\u202f]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?![\w.])"
+    for token in re.findall(pattern, text):
+        token = re.sub(r"[ \u00a0\u202f]", "", token)
+        if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", token):
+            token = token.replace(",", "")
+        else:
+            token = token.replace(",", ".")
+        if num_close(token, expected, tolerance):
+            return True
+    return False
+
+
+def labeled_number(records, labels, expected, tolerance=0.005):
+    for record in records:
+        normalized = record.replace("_", " ")
+        for label in labels:
+            for match in re.finditer(r"(?<!\w)" + re.escape(label) + r"(?!\w)", normalized):
+                # Restrict numbers to this labelled entry. A later "Teachers:"
+                # or semicolon starts another entry even within one text box.
+                value_text = normalized[match.end():]
+                value_text = re.split(r";|(?<!\w)[^\W\d_][\w ]{1,45}\s*:", value_text, maxsplit=1)[0]
+                if has_number(value_text, expected, tolerance):
+                    return True
+    return False
 
 
 def main():
@@ -76,6 +115,8 @@ def main():
     gt_dir = args.groundtruth_workspace or os.path.join(task_root, "groundtruth_workspace")
     all_errors = []
     critical_errors = []
+
+    require_files(args.agent_workspace, ("Enrollment_Overview.xlsx", "Enrollment_Overview.pptx"))
 
     # ---- Check Excel ----
     agent_excel = os.path.join(args.agent_workspace, "Enrollment_Overview.xlsx")
@@ -105,7 +146,7 @@ def main():
                 critical_errors.append("CRITICAL: Enrollment Details missing or reordered required columns")
             a_data = a_rows[1:] if len(a_rows) > 1 else []
             g_data = g_rows[1:] if len(g_rows) > 1 else []
-            if abs(len(a_data) - len(g_data)) > 2:
+            if len(a_data) != len(g_data):
                 all_errors.append(f"Enrollment Details row count: agent={len(a_data)}, expected={len(g_data)}")
 
             # Match by course code (col 1)
@@ -113,6 +154,8 @@ def main():
             for row in a_data:
                 if row and len(row) > 1 and row[1] is not None:
                     a_lookup[str(row[1]).strip().lower()] = row
+            if len(a_lookup) != len(a_data):
+                critical_errors.append("CRITICAL: Duplicate or missing course codes")
             # CRITICAL: all required courses must be present and Total_Enrollments
             # must be correct within a tight tolerance (verifies per-course
             # extraction from Canvas, not just two loose columns).
@@ -127,19 +170,21 @@ def main():
                 if len(a_row) < 8:
                     critical_errors.append(f"CRITICAL: {key} is missing required enrollment values")
                     continue
+                if not str_match(a_row[0], g_row[0]):
+                    critical_errors.append(f"CRITICAL: {key}.Course_Name is incorrect")
                 # Col 2: Total_Enrollments (CRITICAL, tight tol)
                 if len(a_row) > 2 and len(g_row) > 2:
-                    if not num_close(a_row[2], g_row[2], 2):
-                        critical_errors.append(f"CRITICAL: {key}.Total_Enrollments: {a_row[2]} vs {g_row[2]} (tol=2)")
+                    if not num_close(a_row[2], g_row[2], 0):
+                        critical_errors.append(f"CRITICAL: {key}.Total_Enrollments: {a_row[2]} vs {g_row[2]} (exact)")
                 # Col 3: Students (non-critical, tight tol)
                 if len(a_row) > 3 and len(g_row) > 3:
-                    if not num_close(a_row[3], g_row[3], 2):
-                        all_errors.append(f"{key}.Students: {a_row[3]} vs {g_row[3]} (tol=2)")
+                    if not num_close(a_row[3], g_row[3], 0):
+                        all_errors.append(f"{key}.Students: {a_row[3]} vs {g_row[3]} (exact)")
                 # Cols 4-7: Teachers, TAs, Active, Completed (non-critical, tight tol)
                 for ci, cname in ((4, "Teachers"), (5, "TAs"), (6, "Active"), (7, "Completed")):
                     if len(a_row) > ci and len(g_row) > ci:
-                        if not num_close(a_row[ci], g_row[ci], 2):
-                            all_errors.append(f"{key}.{cname}: {a_row[ci]} vs {g_row[ci]} (tol=2)")
+                        if not num_close(a_row[ci], g_row[ci], 0):
+                            all_errors.append(f"{key}.{cname}: {a_row[ci]} vs {g_row[ci]} (exact)")
             if not all_errors and not critical_errors:
                 print("    PASS")
 
@@ -159,8 +204,8 @@ def main():
             # Metrics that are CRITICAL deliverables (core aggregates / ranking /
             # rounding rule). Each maps metric-key -> tolerance for numerics.
             critical_numeric = {
-                "total_enrollments": 2,
-                "avg_enrollment_per_course": 0.5,
+                "total_enrollments": 0,
+                "avg_enrollment_per_course": 0.005,
             }
             critical_string = {"largest_course", "smallest_course"}
 
@@ -188,8 +233,8 @@ def main():
                             if not num_close(a_row[1], g_row[1], critical_numeric[key]):
                                 critical_errors.append(
                                     f"CRITICAL: Summary.{key}: {a_row[1]} vs {g_row[1]} (tol={critical_numeric[key]})")
-                        elif not num_close(a_row[1], g_row[1], 50):
-                            all_errors.append(f"Summary.{key}: {a_row[1]} vs {g_row[1]} (tol=50)")
+                        elif not num_close(a_row[1], g_row[1], 0):
+                            all_errors.append(f"Summary.{key}: {a_row[1]} vs {g_row[1]} (exact)")
                     except (TypeError, ValueError):
                         if key in critical_string:
                             if not str_match(a_row[1], g_row[1]):
@@ -211,7 +256,8 @@ def main():
         if len(slides) < 4:
             critical_errors.append(f"CRITICAL: PPT has {len(slides)} slides, expected at least 4")
         else:
-            texts = [slide_text(slide) for slide in slides]
+            records = [slide_records(slide) for slide in slides]
+            texts = [" ".join(items) for items in records]
             required_titles = ["course enrollment overview", "enrollment summary",
                                "top 5 courses by enrollment", "enrollment distribution"]
             for index, title in enumerate(required_titles):
@@ -224,23 +270,33 @@ def main():
             details = load_sheet_rows(gt_book, "Enrollment Details")[1:]
             metrics = {str(row[0]).lower(): row[1]
                        for row in load_sheet_rows(gt_book, "Summary")[1:]}
-            for metric in ("total_courses", "total_enrollments", "total_students",
-                           "avg_enrollment_per_course"):
-                if not has_number(texts[1], metrics[metric]):
-                    critical_errors.append(f"CRITICAL: PPT summary missing {metric}")
+            labels = {
+                "total_courses": ("total courses", "courses", "всего курсов", "число курсов", "курсов"),
+                "total_enrollments": ("total enrollments", "enrollments", "всего зачислений", "число зачислений"),
+                "total_students": ("total students", "students", "всего студентов", "число студентов"),
+                "avg_enrollment_per_course": ("avg enrollment per course", "average enrollment per course", "average enrollment", "среднее число зачислений", "среднее"),
+            }
+            for metric, aliases in labels.items():
+                if not labeled_number(records[1], aliases, metrics[metric]):
+                    critical_errors.append(f"CRITICAL: PPT summary missing or incorrect {metric}")
             for metric in ("largest_course", "smallest_course"):
                 if str(metrics[metric]).lower() not in texts[1]:
                     critical_errors.append(f"CRITICAL: PPT summary missing {metric}")
             for row in sorted(details, key=lambda row: float(row[2]), reverse=True)[:5]:
-                if (str(row[0]).lower() not in texts[2] or str(row[1]).lower() not in texts[2]
-                        or not has_number(texts[2], row[2], 0)):
+                if not any(str(row[0]).casefold() in record and str(row[1]).casefold() in record
+                           and has_number(record, row[2], 0) for record in records[2]):
                     critical_errors.append(f"CRITICAL: PPT Top-5 missing course data for {row[1]}")
             total = sum(float(row[2]) for row in details)
             for index, label in ((3, "students"), (4, "teachers"), (5, "tas"),
                                  (6, "active"), (7, "completed")):
                 count = sum(float(row[index]) for row in details)
                 percentage = round(count / total * 100, 1)
-                if not has_number(texts[3], percentage, 0.05):
+                aliases = {"students": ("students", "студенты"),
+                           "teachers": ("teachers", "преподаватели"),
+                           "tas": ("tas", "teaching assistants", "ассистенты"),
+                           "active": ("active", "активные"),
+                           "completed": ("completed", "завершённые", "завершенные")}
+                if not labeled_number(records[3], aliases[label], percentage, 0.005):
                     critical_errors.append(f"CRITICAL: PPT distribution missing {label} percentage")
 
         if not any("ppt" in e.lower() or "slide" in e.lower() for e in all_errors + critical_errors):
@@ -251,8 +307,9 @@ def main():
     import psycopg2
     conn = None
     try:
-        conn = psycopg2.connect(host=os.environ.get("PGHOST", "localhost"), port=5432,
-                                dbname="cowork_gym", user="eigent", password="camel")
+        conn = psycopg2.connect(host=os.environ.get("PGHOST", "localhost"),
+                                port=int(os.environ.get("PGPORT", "5432")),
+                                dbname=os.environ.get("PGDATABASE", "cowork_gym"), user="eigent", password="camel")
         cur = conn.cursor()
         cur.execute("SELECT id FROM gsheet.spreadsheets WHERE lower(trim(title)) = %s",
                     ("enrollment dashboard",))
@@ -287,7 +344,7 @@ def main():
             if row is None or not str_match(row.get(header["course_name"]), expected[0]):
                 raise ValueError(f"GSheet missing or incorrect course {key}")
             for index, column in enumerate(required[2:], 2):
-                if not num_close(row.get(header[column]), expected[index], 2):
+                if not num_close(row.get(header[column]), expected[index], 0):
                     raise ValueError(f"GSheet {key}.{column} is incorrect")
         cur.close()
     except ValueError as exc:

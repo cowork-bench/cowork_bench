@@ -68,12 +68,15 @@ if args[0] == "exec":
     run = attempt / "fixture-model" / ("SingleUserTurn-" + task)
     if name.startswith("agent-"):
         record({"operation": "agent_exec", "task": task, "args": args, "attempt": str(attempt)})
+        if task == "infra-exit":
+            raise SystemExit(127)
         if task == "timeout":
             # Trusted Docker/timeout exit status, with no trajectory written.
             raise SystemExit(124)
         run.mkdir(parents=True, exist_ok=True)
         (run / "workspace").mkdir()
-        (run / "traj_log.json").write_text(json.dumps({"status": "success", "config": {"task_dir": task}}))
+        status = "unexpected" if task == "bad-status" else "success"
+        (run / "traj_log.json").write_text(json.dumps({"status": status, "config": {"task_dir": task}}))
         # Must be removed after the agent is stopped and before grading.
         (run / "eval_res.json").write_text(json.dumps({"pass": True, "status": "graded"}))
         # Poison stdout too: it must never override a native failed/missing grade.
@@ -85,8 +88,11 @@ if args[0] == "exec":
         record({"operation": "eval_exec", "task": task, "args": args,
                 "attempt": str(attempt), "planted_verdicts": [str(p) for p in planted]})
         print("Pass: True")
-        if task in ("no-grade", "timeout"):
+        if task in ("no-grade", "timeout", "infra-exit"):
             # Simulate grader setup/discovery failure; no fresh native verdict.
+            raise SystemExit(2)
+        if task == "bad-verdict":
+            (run / "eval_res.json").write_text("[]")
             raise SystemExit(2)
         result = ({"pass": None, "status": "evaluation_error", "stderr": "missing dependency"}
                   if task == "eval-error" else {"pass": task == "pass", "status": "graded"})
@@ -114,7 +120,7 @@ class ParallelRunnerIntegrationTests(unittest.TestCase):
         # fixture reflect the command path contract checked below.
         shutil.copyfile(ROOT / 'scripts/run_eval.py', cls.fixture / 'scripts/run_eval.py')
         (cls.fixture / 'db/init.sql.gz').write_bytes(b'fixture seed: Docker is mocked')
-        cls.tasks = ('pass', 'fail', 'eval-error', 'no-grade', 'timeout')
+        cls.tasks = ('pass', 'fail', 'eval-error', 'no-grade', 'timeout', 'bad-status', 'bad-verdict', 'infra-exit')
         for task in cls.tasks:
             directory = cls.fixture / 'tasks/finalpool' / task
             contents = {
@@ -160,7 +166,9 @@ class ParallelRunnerIntegrationTests(unittest.TestCase):
     def test_native_verdicts_and_errors_are_distinct(self):
         expected = {'pass': ('success', 'True'), 'fail': ('success', 'False'),
                     'eval-error': ('evaluation_error', 'null'),
-                    'no-grade': ('evaluation_error', 'null'), 'timeout': ('wall_timeout', 'null')}
+                    'no-grade': ('evaluation_error', 'null'), 'timeout': ('wall_timeout', 'null'),
+                    'bad-status': ('infra_error', 'null'), 'bad-verdict': ('evaluation_error', 'null'),
+                    'infra-exit': ('infra_error', 'null')}
         self.assertEqual(set(self.rows), set(expected), self.process.stdout + self.process.stderr)
         for task, pair in expected.items():
             with self.subTest(task=task):
@@ -173,7 +181,7 @@ class ParallelRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(aggregate['pass'], '1')
         self.assertEqual(aggregate['eval_fail'], '1')
         self.assertEqual(aggregate['agent_fail'], '1')
-        self.assertEqual(aggregate['other'], '2')
+        self.assertEqual(aggregate['other'], '5')
         self.assertEqual(aggregate['pass_pct'], '')
 
     def test_agent_mounts_are_sanitized_and_attempt_local(self):

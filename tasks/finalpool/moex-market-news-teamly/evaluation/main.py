@@ -115,8 +115,14 @@ def normalized_date(value):
 def mentions_count(text, count):
     if re.search(rf"(?<!\d){count}(?!\d)", text):
         return True
-    words = {2: ("два", "две", "two"), 3: ("три", "three"),
-             4: ("четыре", "four"), 18: ("восемнадцать", "eighteen")}
+    # Whole numeric words, including ordinary Russian grammatical cases;
+    # do not match substrings such as "три" inside "тринадцать".
+    words = {
+        2: ("два", "две", "двух", "двум", "двумя", "two"),
+        3: ("три", "трёх", "трех", "трём", "трем", "тремя", "three"),
+        4: ("четыре", "четырёх", "четырех", "четырём", "четырем", "четырьмя", "four"),
+        18: ("восемнадцать", "восемнадцати", "восемнадцатью", "eighteen"),
+    }
     return any(re.search(rf"\b{word}\b", text, re.IGNORECASE) for word in words.get(count, ()))
 
 

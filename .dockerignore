@@ -30,3 +30,6 @@ docs/archive
 
 # Per-model env profiles — API keys / internal endpoints, never in the image
 env/
+
+# Regression factories contain reference answers; never expose them to the agent.
+tests/

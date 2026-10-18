@@ -20,10 +20,17 @@ import json
 import os
 import sys
 import unicodedata
+import re
+from datetime import datetime, time
+from collections import Counter
 from argparse import ArgumentParser
 
 import openpyxl
 import psycopg2
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook, UnsupportedExternalWorkbook
 
 DB_CONFIG = {
     "host": os.environ.get("PGHOST", "localhost"),
@@ -77,7 +84,9 @@ def check_excel(agent_workspace):
     record("Team_Trip_Plan.xlsx существует", True)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb = load_calculated_workbook(xlsx_path)
+    except (ImportError, RuntimeError, UnsupportedExternalWorkbook):
+        raise
     except Exception as e:
         record("Документ читается", False, str(e), critical=True)
         return
@@ -213,6 +222,89 @@ def check_email():
            f"train={has_train}, plan={has_plan}, city={has_city}")
 
 
+
+def check_required_details(agent_workspace):
+    """Check mandatory output fields against the immutable seed and task guide."""
+    book = load_calculated_workbook(Path(agent_workspace) / "Team_Trip_Plan.xlsx")
+    def table(name, required):
+        sheet = next((book[title] for title in book.sheetnames if title.casefold() == name.casefold()), None)
+        if sheet is None:
+            return None
+        rows = list(sheet.values)
+        header = {str(value).strip().casefold(): index for index, value in enumerate(rows[0])}
+        if any(column.casefold() not in header for column in required):
+            return None
+        return [{column: row[header[column.casefold()]] for column in required}
+                for row in rows[1:] if any(value is not None for value in row)]
+    def numeric(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    def clock(value):
+        if isinstance(value, (time, datetime)):
+            return value.hour * 60 + value.minute if value.second == value.microsecond == 0 else None
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::00)?", str(value).strip())
+        if not match or int(match[1]) > 23 or int(match[2]) > 59:
+            return None
+        return int(match[1]) * 60 + int(match[2])
+    travel = table("Travel", ("Train_No", "Direction", "Departure", "Arrival", "Duration_Min",
+                               "Seat_Class", "Per_Person_RUB", "Total_Budget_RUB"))
+    fares = {"эконом": 5500, "economy": 5500, "эконом+": 7500,
+             "economy+": 7500, "бизнес": 14000, "business": 14000}
+    travel_ok = bool(travel) and len(travel) == 1
+    if travel_ok:
+        row = travel[0]
+        fare = fares.get(str(row["Seat_Class"]).strip().casefold())
+        travel_ok = (normalize(str(row["Train_No"])) == "752a" and bool(row["Direction"])
+                     and clock(row["Departure"]) == 6 * 60 + 50
+                     and clock(row["Arrival"]) == 10 * 60 + 50
+                     and numeric(row["Duration_Min"]) == 240 and fare is not None
+                     and numeric(row["Per_Person_RUB"]) == fare
+                     and numeric(row["Total_Budget_RUB"]) == fare * 15)
+    record("Travel: required seeded schedule, fare and budget for 15 people", travel_ok, critical=True)
+
+    recipes = json.loads((Path(__file__).resolve().parents[4] /
+                          "local_servers/kulinar-mcp/src/data/all_recipes.json").read_text(encoding="utf-8"))
+    source = {recipe["name"].strip().casefold(): recipe for recipe in recipes}
+    menu = table("Menu", ("Course_Type", "Dish_Name", "Cook_Time_Min", "Servings_Yield", "Key_Ingredients", "Notes"))
+    menu_ok = menu is not None and len(menu) == 6
+    categories = Counter()
+    aliases = {"салат": {"закуска", "салат", "appetizer", "salad", "starter"},
+               "закуска": {"закуска", "appetizer", "starter"},
+               "горячее": {"горячее", "горячее блюдо", "hot", "main"},
+               "суп": {"суп", "soup"}, "десерт": {"десерт", "dessert"}}
+    if menu_ok:
+        for row in menu:
+            recipe = source.get(str(row["Dish_Name"]).strip().casefold())
+            if recipe is None:
+                menu_ok = False
+                continue
+            category = recipe["category"]
+            categories[category] += 1
+            ingredients = str(row["Key_Ingredients"]).casefold().replace("ё", "е")
+            menu_ok = (menu_ok
+                       and str(row["Course_Type"]).strip().casefold() in aliases.get(category, set())
+                       and numeric(row["Cook_Time_Min"]) in {recipe["cook_time_minutes"], recipe["total_time_minutes"]}
+                       and (numeric(row["Servings_Yield"]) or 0) > 0
+                       and any(item["name"].casefold().replace("ё", "е") in ingredients
+                               for item in recipe["ingredients"]))
+        menu_ok = (menu_ok and categories["салат"] + categories["закуска"] == 2
+                   and categories["горячее"] == 3 and categories["суп"] + categories["десерт"] == 1)
+    record("Menu: six source recipes with required course mix and recipe fields", menu_ok, critical=True)
+
+    timeline = table("Timeline", ("Time", "Activity", "Location", "Responsible_Person", "Notes"))
+    timeline_ok = timeline is not None and len(timeline) >= 6
+    if timeline_ok:
+        times = [clock(row["Time"]) for row in timeline]
+        timeline_ok = (None not in times and times == sorted(times)
+                       and times[0] <= 7 * 60 and times[-1] >= 20 * 60
+                       and all(row["Activity"] and row["Location"] and row["Responsible_Person"]
+                               for row in timeline))
+    record("Timeline: at least six chronological activities covering the full day", timeline_ok, critical=True)
+    book.close()
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--agent_workspace", required=False, default=".")
@@ -222,6 +314,8 @@ def main():
     args = parser.parse_args()
 
     check_excel(args.agent_workspace)
+    if not CRITICAL_FAILED:
+        check_required_details(args.agent_workspace)
     check_gcal()
     check_email()
 

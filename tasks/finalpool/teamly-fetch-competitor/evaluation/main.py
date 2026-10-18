@@ -51,6 +51,7 @@ DETAILED_PRODUCTS = ["Alpha Pro", "Gamma Ultra", "Zeta Max"]
 CRITICAL_CHECKS = {
     "Product Listing data matches expected",
     "Detailed Analysis has 3 rows",
+    "Detailed Analysis column order matches task",
     "Product features match API source",
     "Detailed Analysis content matches API source",
     "Teamly page with 'Competitor' in title exists",
@@ -237,6 +238,10 @@ def check_excel(agent_workspace):
         record("Sheet 'Detailed Analysis' exists", True)
         ws = wb[detail_sheet]
         rows = list(ws.iter_rows(values_only=True))
+        headers_ok = bool(rows) and [normalized_text(value) for value in rows[0]] == [
+            "product", "description", "pros", "cons", "target_market"]
+        record("Detailed Analysis column order matches task", headers_ok)
+        all_ok = all_ok and headers_ok
         data_rows = rows[1:] if len(rows) > 1 else []
         detail_rows_ok = len(data_rows) == 3
         record("Detailed Analysis has 3 rows", detail_rows_ok,

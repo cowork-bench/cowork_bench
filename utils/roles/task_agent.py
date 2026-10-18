@@ -13,6 +13,7 @@ from utils.aux_tools.basic import make_claim_done, sleep
 from utils.aux_tools.overlong_tool_manager import make_overlong_tools
 from utils.aux_tools.python_interpretor import make_python_execute
 from utils.data_structures.task_config import TaskConfig
+from utils.task_runner.errors import PreprocessError
 from utils.general.helper import copy_folder_contents, print_color
 from utils.mcp.tool_servers import build_mcp_clients
 from utils.api_model.model_provider import resolve_provider
@@ -24,10 +25,6 @@ class TaskStatus(Enum):
     MAX_TURNS_REACHED = "max_turns_reached"
     INTERRUPTED = "interrupted"
     INFRA_ERROR = "infra_error"
-
-
-class PreprocessError(RuntimeError):
-    """Task preparation failed before the agent could execute the task."""
 
 
 async def _noop(*args, **kwargs) -> str:

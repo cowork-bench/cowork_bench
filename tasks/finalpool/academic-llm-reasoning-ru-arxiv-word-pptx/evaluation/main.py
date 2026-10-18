@@ -46,14 +46,62 @@ def mentions(text, phrase):
     return f" {normalized(phrase)} " in f" {normalized(text)} "
 
 
+RESULT_BENCHMARKS = ("GSM8K", "MATH", "SVAMP", "AQuA", "Game of 24", "Blocksworld",
+                     "Creative Writing", "Mini Crosswords")
+
+
+def benchmark_pattern(name):
+    return r"\b" + r"[\W_]+".join(re.findall(r"\w+", name)) + r"\b"
+
+
+def matching_values(text, value):
+    for match in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)?(?![\w.])", text):
+        number = float(match[0].replace(",", "."))
+        if any(abs(number - target) < 1e-6 for target in (float(value), float(value) / 100)):
+            yield match
+
+
 def has_result(text, fact):
-    if not mentions(text, fact["benchmark"]):
-        return False
-    numbers = re.findall(r"(?<![\w.])\d+(?:[.,]\d+)?(?![\w.])", str(text))
-    value = float(fact["value"])
-    # Accept percentages and equivalent fractional accuracies, decimal comma too.
-    return any(abs(float(n.replace(",", ".")) - target) < 1e-6
-               for n in numbers for target in (value, value / 100))
+    """Require a local benchmark/value pair, not two tokens anywhere in a document.
+
+    A benchmark labels subsequent values in its clause until another benchmark.
+    Also accept ordinary reverse notation such as ``56.6% on GSM8K``. Sentence
+    and semicolon boundaries stop a number being borrowed from another result.
+    This verifies numerical anchors; model/baseline attribution and interpretation
+    remain outside this deterministic check.
+    """
+    names = set(RESULT_BENCHMARKS) | {fact["benchmark"]}
+    for clause in re.split(r";|[.!?](?=\s+[A-Za-zА-Яа-я])", str(text)):
+        benchmarks = sorted((m.start(), m.end(), name) for name in names
+                            for m in re.finditer(benchmark_pattern(name), clause, re.IGNORECASE))
+        for value in matching_values(clause, fact["value"]):
+            if any(start <= value.start() < end for start, end, _ in benchmarks):
+                continue  # e.g. the 24 inside the name Game of 24 is not a score.
+            before = [b for b in benchmarks if b[1] <= value.start()]
+            after = [b for b in benchmarks if b[0] >= value.end()]
+            chosen = before[-1] if before else (after[0] if after else None)
+            if after:
+                between = clause[value.end():after[0][0]]
+                reverse_link = re.fullmatch(r"[\s%():,=–—-]*(?:(?:on|на|for)\s*)?", between, re.IGNORECASE)
+                if reverse_link and (not before or after[0][0] - value.end() < value.start() - before[-1][1]):
+                    chosen = after[0]
+            if chosen and normalized(chosen[2]) == normalized(fact["benchmark"]):
+                return True
+    return False
+
+
+def table_has_result(table, fact):
+    """Support both long-form Benchmark/Score rows and benchmark column headers."""
+    rows = [[cell.text for cell in row.cells] for row in table.rows]
+    if any(has_result(" | ".join(row), fact) for row in rows):
+        return True
+    if rows:
+        for index, header in enumerate(rows[0]):
+            if mentions(header, fact["benchmark"]):
+                if any(index < len(row) and has_result(f"{fact['benchmark']}: {row[index]}", fact)
+                       for row in rows[1:]):
+                    return True
+    return False
 
 
 def word_text(doc):
@@ -125,7 +173,13 @@ def check_word_doc(agent_workspace, gt_data):
     checks.append(_check("Summary rows match the five source papers", papers_ok))
     prose = "\n".join(p.text for p in doc.paragraphs)
     # Numerical discussion must appear in the review, not only in its table.
-    facts_ok = all(has_result(prose, fact) for fact in gt_data["review_doc"]["required_result_facts"])
+    papers = gt_data["papers_used"]
+    facts_ok = all(any(has_result(prose, fact) for fact in paper["results"]) for paper in papers)
+    # The task names these benchmarks, but does not prescribe every primary
+    # score or require the same chosen experiment in prose and summary table.
+    for benchmark in ("GSM8K", "Game of 24", "Blocksworld", "MATH"):
+        facts_ok = facts_ok and any(has_result(prose, fact) for paper in papers
+                                   for fact in paper["results"] if fact["benchmark"] == benchmark)
     checks.append(_check("Word discussion includes source benchmark results", facts_ok))
     keyword_ok = all(mentions(word_text(doc), term) for term in gt_data["review_doc"]["required_mentions"])
     checks.append(_check("All required keywords present in Word doc", keyword_ok))
@@ -147,15 +201,18 @@ def check_pptx(agent_workspace, gt_data):
         title_ok = title_ok and "2022" in texts[0] and "2023" in texts[0]
         overview_ok = all(mentions(texts[1], p["title"]) for p in gt_data["papers_used"])
         cot_ok = all(mentions(texts[2], t) for t in ["chain-of-thought", "self-consistency"])
-        cot_ok = cot_ok and all(has_result(texts[2], f) for f in gt_data["review_doc"]["required_result_facts"][:2])
+        cot_ok = cot_ok and all(any(has_result(texts[2], f) for f in paper["results"])
+                                 for paper in gt_data["papers_used"][:2])
         tree_ok = mentions(texts[3], "tree of thoughts") and mentions(texts[3], "RAP")
-        tree_ok = tree_ok and all(has_result(texts[3], f) for f in gt_data["review_doc"]["required_result_facts"][2:4])
+        tree_ok = tree_ok and all(any(has_result(texts[3], f) for f in paper["results"])
+                                   for paper in gt_data["papers_used"][2:4])
         process_ok = any(mentions(texts[4], t) for t in ["process supervision", "process-supervised", "PRM"])
-        process_ok = process_ok and all(has_result(texts[4], f) for f in gt_data["review_doc"]["required_result_facts"][4:])
-        table_texts = ["\n".join(cell.text for row in shape.table.rows for cell in row.cells)
-                       for shape in presentation.slides[5].shapes if shape.has_table]
-        comparison_ok = any(sum(has_result(text, fact) for fact in gt_data["review_doc"]["required_result_facts"]) >= 2
-                            for text in table_texts)
+        process_ok = process_ok and any(has_result(texts[4], f) for f in gt_data["papers_used"][4]["results"])
+        tables = [shape.table for shape in presentation.slides[5].shapes if shape.has_table]
+        comparison_facts = {(fact["benchmark"], fact["value"]): fact
+                            for paper in gt_data["papers_used"] for fact in paper["results"]}
+        comparison_ok = any(sum(table_has_result(table, fact)
+                                for fact in comparison_facts.values()) >= 2 for table in tables)
         conclusion_ok = any(mentions(texts[6], t) for t in ["заключение", "conclusion", "выводы"])
         content_ok = all([title_ok, overview_ok, cot_ok, tree_ok, process_ok, comparison_ok, conclusion_ok])
     checks.append(_check("Required slide content present", content_ok))
@@ -163,9 +220,11 @@ def check_pptx(agent_workspace, gt_data):
 
 
 def count_variants(text):
-    # Two common terminal word-count conventions: whitespace tokens and lexical
-    # words (with technical hyphens/apostrophes kept inside a word).
-    return {len(text.split()), len(re.findall(r"\w+(?:[-'’]\w+)*", text, flags=re.UNICODE))}
+    # Common terminal conventions differ on technical hyphens/apostrophes.
+    # Count paragraphs/table cells and slide text; notes, charts and embedded
+    # objects are outside this extraction scope (not a universal Office count).
+    return {len(text.split()), len(re.findall(r"\w+(?:[-'’]\w+)*", text, flags=re.UNICODE)),
+            len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))}
 
 
 def check_word_count(agent_workspace):

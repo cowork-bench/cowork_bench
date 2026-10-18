@@ -46,9 +46,11 @@ agent-planted links. The agent container is removed before grading starts.
 `grade_process` distinguishes explicit task-check exits (0/1) from uncaught
 exceptions or other exits (2). An unresolved evaluator or evaluation exception
 produces `pass: null`, `status: evaluation_error`, with diagnostics retained.
-Preprocess failure stops agent execution and records `infra_error`. A trusted
+Preprocess failure stops agent execution and records `infra_error` in both CAMEL
+and Strands. Unknown/interrupted native statuses, malformed verdict objects and
+contradictory nonzero process exits remain unscored. A trusted
 outer timeout remains a budget failure even if no trajectory was flushed.
-Runs with infrastructure/evaluation errors have no aggregate `pass_pct` in the
+Runs with infrastructure/evaluation errors or incomplete task coverage have no aggregate `pass_pct` in the
 central index; report their coverage and errors separately.
 
 The image adds Calc, uses Python 3.12 for Python MCP environments and fails on
@@ -60,20 +62,48 @@ MOEX and Yahoo declare the PostgreSQL driver they import.
 Install Python 3.12, LibreOffice Calc, rsync, and these Python packages:
 
 ```sh
-python -m pip install openpyxl python-docx python-pptx psycopg2-binary termcolor pypdf
+python -m pip install openpyxl python-docx python-pptx psycopg2-binary termcolor pypdf pandas
 python -m unittest discover -s tests -v
 bash -n run_parallel.sh scripts/run_containerized.sh
 ```
 
 Tests run real evaluator code on valid fixture artifacts and deliberately
-corrupted variants. PostgreSQL-dependent tests adapt query results; they do not
-start a database. Formula tests use real LibreOffice. The parallel-runner test
+corrupted variants. Most PostgreSQL-dependent tests adapt query results. CI additionally restores
+`db/init.sql.gz` into disposable PostgreSQL 15 and runs opt-in integration checks
+for MOEX evaluator/MCP price agreement, HR selection, Canvas seed/fixture agreement
+and shared-sheet prerequisites.
+Set `COWORK_TEST_PG=1` only against an isolated seeded test database to run these
+locally; they insert and delete uniquely named spreadsheet fixtures. Formula tests use real LibreOffice. The parallel-runner test
 executes the shell script with a fake Docker CLI; it checks orchestration and
 summary behavior, not Docker networking or image build success. CI runs the same
-suite without model credentials.
+suite without model credentials. `tests/` is excluded from the runtime image
+because its output factories contain reference answers.
 
-A clean full image build and representative tasks against the live seeded
+A clean full image build and representative full agent/MCP tasks against the seeded
 PostgreSQL database are still required before using the revised image for a
 published benchmark. This patch does not rewrite historical scores. Regrade
 preserved artifacts under a pinned version, record evaluation errors separately,
 and rerun only cases whose original execution or source state was invalid.
+
+
+## Second-review corrections and remaining cases
+
+The follow-up review compared the original benchmark, initial PR and corrected
+code using full evaluator invocations. It exposed additional omitted-sheet and
+label/value association bypasses, over-strict treatment of blank Google tabs and
+presentation formats, legitimate tied price extrema, omitted saved recipe files,
+and valid alternate paper results and word-count conventions. The second-review
+test modules preserve both invalid submissions and valid alternative controls.
+
+These repairs still do not enforce every clause of every task. The enrollment
+reference workbook is not sorted by the displayed Russian course names, while
+the prompt asks for alphabetical order; this fixture discrepancy remains open.
+Feature-token presence can accept qualified/negated prose, and the news task does
+not reject an extra worksheet. A new read-only database role or immutable SQL
+snapshot boundary is not part of this patch. Untouched graders that catch their
+own runtime exceptions and exit with an explicit failed-check code also remain
+outside the wrapper's automatic infrastructure classification.
+
+The detailed problems, triggers, reasoning and evidence are recorded in
+[upstream PR #4](https://github.com/cowork-bench/cowork_bench/pull/4). Historical
+scores and the benchmark's task lineage are unchanged.

@@ -69,8 +69,8 @@ class CanvasIntegrityTests(unittest.TestCase):
             book = openpyxl.load_workbook(POOL / task / "groundtruth_workspace/Enrollment_Overview.xlsx")
             rows = list(book["Enrollment Details"].values)
         else:
-            rows = [("Metric", "Value"), ("Total_Courses", 22),
-                    ("Overall_Avg_Score", 68.0)]
+            book = openpyxl.load_workbook(POOL / task / "groundtruth_workspace/Canvas_Grade_Summary.xlsx")
+            rows = list(book["Summary"].values)
         cursor = QueryCursor(rows, present)
         connection = types.SimpleNamespace(cursor=lambda: cursor, close=lambda: None)
         database = types.SimpleNamespace(connect=lambda **kwargs: connection)

@@ -26,6 +26,7 @@ import re
 import sys
 from argparse import ArgumentParser
 from datetime import datetime
+from collections import Counter
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
@@ -37,6 +38,7 @@ CRITICAL_CHECKS = {
     ">= 4 distinct categories incl. at least one soup and one vegetable",
     "No category repeated on consecutive days",
     "Document reports the selected recipes correctly",
+    "Recipe JSON inputs are complete and consistent with source and difficulty filter",
     "filtered_recipes.json valid (all diff<=3, contains the five dishes)",
     "memory.json: dietary_preferences + matching selections",
 }
@@ -192,6 +194,72 @@ def reported_recipe_matches(block, recipe):
     return category_ok and difficulty_ok and ingredients_ok
 
 
+
+def recipe_json_inputs_valid(workspace, selected_names):
+    """Validate required saved records, independent of the report's prose."""
+    def validate(records):
+        if not isinstance(records, list) or not records:
+            raise ValueError("recipe records must be a nonempty JSON array")
+        names = []
+        for record in records:
+            if not isinstance(record, dict) or not {"name", "category", "difficulty", "ingredients"} <= set(record):
+                raise ValueError("a recipe is missing name/category/difficulty/ingredients")
+            name = _norm_name(record["name"])
+            reference = KULINAR_BY_NAME.get(name)
+            if (reference is None or _norm_name(record["category"]) != _norm_name(reference["category"])
+                    or record["difficulty"] != reference["difficulty"]):
+                raise ValueError("recipe name, category or difficulty disagrees with source")
+            reference_ingredients = {_norm_name(item["name"]): item for item in reference["ingredients"]}
+            ingredients = record["ingredients"]
+            if isinstance(ingredients, str):
+                ingredients = re.split(r"[,;\n]", ingredients)
+            if not isinstance(ingredients, list) or not ingredients:
+                raise ValueError("ingredients must list the recipe's ingredients")
+            actual = set()
+            for item in ingredients:
+                if isinstance(item, dict):
+                    ingredient_name = _norm_name(item.get("name", ""))
+                    if ingredient_name not in reference_ingredients:
+                        raise ValueError("unknown ingredient")
+                    source_item = reference_ingredients[ingredient_name]
+                    if "quantity" in item:
+                        actual_quantity, expected_quantity = item["quantity"], source_item.get("quantity")
+                        if expected_quantity is None:
+                            equal_quantity = actual_quantity in (None, "", "по вкусу")
+                        else:
+                            try:
+                                equal_quantity = float(actual_quantity) == float(expected_quantity)
+                            except (ValueError, TypeError):
+                                equal_quantity = actual_quantity == expected_quantity
+                        if not equal_quantity:
+                            raise ValueError("ingredient quantity disagrees with source")
+                    if "unit" in item and _norm_name(item["unit"] or "") != _norm_name(source_item.get("unit") or ""):
+                        raise ValueError("ingredient unit disagrees with source")
+                else:
+                    text = _norm_name(item)
+                    matches = [key for key in reference_ingredients if key in text]
+                    if not matches:
+                        raise ValueError("unknown ingredient text")
+                    ingredient_name = max(matches, key=len)
+                actual.add(ingredient_name)
+            if actual != set(reference_ingredients):
+                raise ValueError("ingredient list is incomplete")
+            names.append(name)
+        return names
+    try:
+        with open(os.path.join(workspace, "all_recipes.json"), encoding="utf-8") as file:
+            all_records = json.load(file)
+        with open(os.path.join(workspace, "filtered_recipes.json"), encoding="utf-8") as file:
+            filtered_records = json.load(file)
+        all_names = validate(all_records)
+        filtered_names = validate(filtered_records)
+        expected = Counter(_norm_name(record["name"]) for record in all_records if record["difficulty"] <= 3)
+        return (Counter(filtered_names) == expected and
+                {_norm_name(name) for name in selected_names} <= set(filtered_names)), ""
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return False, str(exc)
+
+
 def is_vegetable(recipe):
     tags = [str(t).lower() for t in recipe.get("tags", [])]
     if "овощное" in tags:
@@ -331,6 +399,10 @@ def main():
             filt_detail = f"error reading filtered_recipes.json: {e}"
     check("filtered_recipes.json valid (all diff<=3, contains the five dishes)",
           all_known and filt_ok, filt_detail)
+
+    inputs_ok, inputs_detail = recipe_json_inputs_valid(agent_ws, [name for _, name in selected])
+    check("Recipe JSON inputs are complete and consistent with source and difficulty filter",
+          inputs_ok, inputs_detail)
 
     # ---- CRITICAL 5: memory.json dietary_preferences + matching selections ----
     memory_path = os.path.join(agent_ws, "memory", "memory.json")

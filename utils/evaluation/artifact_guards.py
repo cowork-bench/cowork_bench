@@ -275,14 +275,15 @@ def require_gsheet(title, required_tabs):
             if not selected or (required_tabs and {t.lower() for t in required_tabs} -
                                 {t.strip().lower() for _, t in selected}):
                 continue
-            populated = True
+            populated_tabs = []
             for sheet_id, _ in selected:
                 cur.execute("SELECT COUNT(DISTINCT row_index) FROM gsheet.cells "
-                            "WHERE spreadsheet_id = %s AND sheet_id = %s",
+                            "WHERE spreadsheet_id = %s AND sheet_id = %s "
+                            "AND value IS NOT NULL AND trim(value) != ''",
                             (spreadsheet_id, sheet_id))
-                if cur.fetchone()[0] < 2:
-                    populated = False
-            if populated:
+                populated_tabs.append(cur.fetchone()[0] >= 2)
+            # With no prescribed tab names, a spare blank default tab is allowed.
+            if (all(populated_tabs) if required_tabs else any(populated_tabs)):
                 cur.close()
                 return
         print(f"FAIL: required Google Sheet {title}: spreadsheet or required populated tabs missing")

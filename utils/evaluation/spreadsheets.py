@@ -27,6 +27,12 @@ def _require_internal_calculation(path, workbook):
                 if cell.data_type == "f"]
     formulas.extend(name.attr_text for name in workbook.defined_names.values() if name.attr_text)
     for formula in formulas:
+        # openpyxl represents OOXML array formulas with a structured object.
+        # Inspect its expression with the same external-reference checks.
+        if isinstance(formula, openpyxl.worksheet.formula.ArrayFormula):
+            formula = formula.text
+        if not isinstance(formula, str):
+            raise RuntimeError("Unsupported spreadsheet formula representation")
         from openpyxl.formula import Tokenizer
         tokens = Tokenizer(formula if formula.startswith("=") else "=" + formula).items
         for token in tokens:
@@ -84,11 +90,14 @@ def load_calculated_workbook(path):
         shutil.copyfile(path, source / "workbook.xlsx")
         profile = temporary / "profile"
         _write_calculation_profile(profile)
-        result = subprocess.run(
-            [engine, "-env:UserInstallation=" + profile.as_uri(), "--headless",
-             "--convert-to", "xlsx", "--outdir", str(output), str(source / "workbook.xlsx")],
-            capture_output=True, text=True, timeout=60,
-        )
+        try:
+            result = subprocess.run(
+                [engine, "-env:UserInstallation=" + profile.as_uri(), "--headless",
+                 "--convert-to", "xlsx", "--outdir", str(output), str(source / "workbook.xlsx")],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("LibreOffice calculation process failed") from exc
         calculated = output / "workbook.xlsx"
         if result.returncode or not calculated.is_file():
             raise RuntimeError("LibreOffice could not recalculate workbook: " +

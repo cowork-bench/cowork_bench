@@ -21,6 +21,10 @@ import sys
 import openpyxl
 import psycopg2
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook, UnsupportedExternalWorkbook
+
 DB_CONFIG = {
     "host": os.environ.get("PGHOST", "localhost"),
     "port": 5432,
@@ -41,6 +45,9 @@ CRITICAL_CHECKS = {
     "Excel file readable",
     "Dish Costs has required columns",
     "Dish Costs sheet exists",
+    "Ingredient Prices sheet exists",
+    "Ingredient Prices exactly reproduce used ingredients, units and source dishes",
+    "Budget Summary sheet exists",
     "Dish Costs has 5 data rows",
     "Dishes are real kulinar recipes from 5 categories",
     "Ingredient_List matches the recipe ingredients with known prices",
@@ -133,7 +140,9 @@ def check_excel(agent_workspace):
     record("Excel file exists", True)
 
     try:
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = load_calculated_workbook(excel_path)
+    except (ImportError, RuntimeError, UnsupportedExternalWorkbook):
+        raise
     except Exception as e:
         record("Excel file readable", False, str(e))
         return
@@ -248,6 +257,33 @@ def check_excel(agent_workspace):
             record("Ingredient Prices: Price_Per_Unit matches grocery_prices.json",
                    ok and checked >= 5, detail or f"checked {checked} matched ingredients")
 
+        expected_usage = {}
+        for dish_name, _, _, _ in dishes:
+            if dish_name in by_name:
+                for item in by_name[dish_name]["ingredients"]:
+                    if item["name"] in price_map:
+                        expected_usage.setdefault(norm_name(item["name"]), set()).add(norm_name(dish_name))
+        unit_col = col_idx(header, "Unit")
+        source_col = col_idx(header, "Source_Dish")
+        complete = None not in (ci_in, ci_pr, unit_col, source_col) and bool(expected_usage)
+        observed = set()
+        source_prices = {norm_name(name): value for name, value in price_map.items()}
+        if complete:
+            for row in data:
+                ingredient = norm_name(row[ci_in])
+                if ingredient in observed or ingredient not in expected_usage:
+                    complete = False
+                    continue
+                observed.add(ingredient)
+                reference = source_prices[ingredient]
+                sources = {norm_name(value) for value in str(row[source_col] or "").split(",") if norm_name(value)}
+                complete = (complete and norm_name(row[unit_col]) == norm_name(reference["unit"])
+                            and num_close(row[ci_pr], reference["price_per_unit"], 0.01)
+                            and sources == expected_usage[ingredient])
+        record("Ingredient Prices exactly reproduce used ingredients, units and source dishes",
+               complete and observed == set(expected_usage),
+               f"missing={sorted(set(expected_usage) - observed)}")
+
     # ---------------- Budget Summary ----------------
     bs_name = find_sheet(wb, "budget") or find_sheet(wb, "summary")
     if not bs_name:
@@ -272,12 +308,14 @@ def check_excel(agent_workspace):
             if len(costs) == 5:
                 exp_total = round(sum(c for _, c in costs), 2)
                 exp_avg = round(exp_total / 5, 2)
-                exp_cheap = min(costs, key=lambda x: x[1])[0]
-                exp_exp = max(costs, key=lambda x: x[1])[0]
+                minimum = min(cost for _, cost in costs)
+                maximum = max(cost for _, cost in costs)
+                exp_cheap = {norm_name(name) for name, cost in costs if cost == minimum}
+                exp_exp = {norm_name(name) for name, cost in costs if cost == maximum}
                 ok = (num_close(kv["Total_Cost"], exp_total, 1.0)
                       and num_close(kv["Average_Cost_Per_Dish"], exp_avg, 0.5)
-                      and norm_name(kv["Cheapest_Dish"]) == norm_name(exp_cheap)
-                      and norm_name(kv["Most_Expensive_Dish"]) == norm_name(exp_exp))
+                      and norm_name(kv["Cheapest_Dish"]) in exp_cheap
+                      and norm_name(kv["Most_Expensive_Dish"]) in exp_exp)
                 record("Budget Summary aggregates correct", ok,
                        f"got total={kv['Total_Cost']} avg={kv['Average_Cost_Per_Dish']} "
                        f"cheap={kv['Cheapest_Dish']} exp={kv['Most_Expensive_Dish']}; "

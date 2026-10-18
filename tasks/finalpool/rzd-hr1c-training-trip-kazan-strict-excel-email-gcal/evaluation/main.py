@@ -15,13 +15,18 @@ import json
 import os
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, time
+import re
 from email.utils import getaddresses
 from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
 
 import psycopg2
 import openpyxl
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook, UnsupportedExternalWorkbook
 
 DB_CONFIG = {
     "host": os.environ.get("PGHOST", "localhost"),
@@ -106,7 +111,9 @@ def check_excel(agent_workspace):
     record("xlsx-отчёт существует", True)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb = load_calculated_workbook(xlsx_path)
+    except (ImportError, RuntimeError, UnsupportedExternalWorkbook):
+        raise
     except Exception as e:
         record("Excel-файл читается", False, str(e), critical=True)
         return
@@ -245,10 +252,41 @@ def check_excel(agent_workspace):
                len(prices) == 10 and all(p == 4500 for p in prices),
                f"цены: {prices}")
 
+        # Validate the report itself; correct calendar windows cannot compensate
+        # for fabricated departure/arrival, class or fare in Travel_Plan.
+        required = ("Train_No", "Departure_Time", "Arrival_Time", "Seat_Class", "Ticket_Price_RUB")
+        header = [str(value).strip().casefold() for value in next(ws.iter_rows(values_only=True), ())]
+        columns = [header.index(name.casefold()) if name.casefold() in header else None
+                   for name in required]
+        def clock(value):
+            if isinstance(value, (datetime, time)):
+                return value.strftime("%H:%M") if value.second == value.microsecond == 0 else None
+            match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::00)?", str(value).strip())
+            return f"{int(match[1]):02d}:{match[2]}" if match else None
+        def matches(journeys, train, depart, arrive):
+            if None in columns or len(journeys) != 5:
+                return False
+            for row in journeys:
+                values = [row[index] for index in columns]
+                number = str(values[0]).strip().upper().translate(str.maketrans({"G": "Г", "A": "А"}))
+                try:
+                    fare_ok = abs(float(values[4]) - 4500) <= 0.01
+                except (TypeError, ValueError):
+                    fare_ok = False
+                if (number != train or clock(values[1]) != depart or clock(values[2]) != arrive
+                        or str(values[3]).strip().casefold() not in {"эконом", "economy", "economy class"}
+                        or not fare_ok):
+                    return False
+            return True
+        record("Travel_Plan: реальные поезда, время, Эконом и тариф 4500 ₽",
+               matches(outbound, "716Г", "06:25", "11:50")
+               and matches(ret, "717Г", "18:30", "23:55"),
+               "Expected the seeded 716Г/717Г schedules and Economy fare", critical=True)
+
     # ── Budget_Summary ───────────────────────────────────────────────────
     ws = find_sheet(wb, "budget", "summar", "бюджет")
     if ws is None:
-        record("лист Budget_Summary найден", False, f"листы: {wb.sheetnames}")
+        record("лист Budget_Summary найден", False, f"листы: {wb.sheetnames}", critical=True)
     else:
         record("лист Budget_Summary найден", True)
         rows = data_rows(ws)
@@ -263,6 +301,32 @@ def check_excel(agent_workspace):
         has_45000 = 45000.0 in all_vals
         record("в Budget_Summary есть итог ровно 45 000 ₽",
                has_45000, f"числовые значения: {sorted(all_vals)}")
+
+        header = {str(value).strip().casefold(): index
+                  for index, value in enumerate(next(ws.iter_rows(values_only=True), ()))}
+        required = ("Item", "Count", "Unit_Price_RUB", "Total_RUB")
+        associated = len(rows) == 3 and all(name.casefold() in header for name in required)
+        budget = {}
+        if associated:
+            for row in rows:
+                label = str(row[header["item"]]).strip().casefold()
+                kind = ("outbound" if "туда" in label else "return" if "обрат" in label
+                        else "total" if "итого" in label or label == "total" else None)
+                if kind is None or kind in budget:
+                    associated = False
+                    continue
+                budget[kind] = row
+            for kind, row in budget.items():
+                expected = {"Total_RUB": 45000} if kind == "total" else {
+                    "Count": 5, "Unit_Price_RUB": 4500, "Total_RUB": 22500}
+                for column, expected_value in expected.items():
+                    try:
+                        associated = associated and abs(float(row[header[column.casefold()]]) - expected_value) <= 0.01
+                    except (TypeError, ValueError):
+                        associated = False
+        record("Budget_Summary: две группы по 5 × 4500 ₽ и связанный итог 45000 ₽",
+               associated and set(budget) == {"outbound", "return", "total"},
+               f"Budget groups: {list(budget)}", critical=True)
 
 
 # ─── Calendar ────────────────────────────────────────────────────────────────

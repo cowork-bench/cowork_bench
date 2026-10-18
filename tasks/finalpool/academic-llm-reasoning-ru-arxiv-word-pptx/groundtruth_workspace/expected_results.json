@@ -103,6 +103,14 @@
         {
           "benchmark": "GSM8K",
           "value": 56.6
+        },
+        {
+          "benchmark": "GSM8K",
+          "value": 17.9
+        },
+        {
+          "benchmark": "SVAMP",
+          "value": 79.0
         }
       ]
     },
@@ -120,6 +128,22 @@
         {
           "benchmark": "GSM8K",
           "value": 74.4
+        },
+        {
+          "benchmark": "GSM8K",
+          "value": 56.6
+        },
+        {
+          "benchmark": "GSM8K",
+          "value": 17.8
+        },
+        {
+          "benchmark": "SVAMP",
+          "value": 79.0
+        },
+        {
+          "benchmark": "SVAMP",
+          "value": 86.6
         }
       ]
     },
@@ -137,6 +161,10 @@
         {
           "benchmark": "Game of 24",
           "value": 74
+        },
+        {
+          "benchmark": "Game of 24",
+          "value": 4
         }
       ]
     },
@@ -160,6 +188,10 @@
         {
           "benchmark": "GSM8K",
           "value": 48.3
+        },
+        {
+          "benchmark": "Blocksworld",
+          "value": 28
         }
       ]
     },
@@ -178,6 +210,14 @@
         {
           "benchmark": "MATH",
           "value": 78.2
+        },
+        {
+          "benchmark": "MATH",
+          "value": 72.4
+        },
+        {
+          "benchmark": "MATH",
+          "value": 5.8
         }
       ]
     }

@@ -188,24 +188,30 @@ class RzdHrIntegrityTests(unittest.TestCase):
         self.assert_result(1)
 
     def catering_fixture(self):
-        self.events = [('Отправление', datetime(2026, 3, 10, 6, 50)),
-                       ('Прибытие и заселение', datetime(2026, 3, 10, 10, 45)),
+        self.events = [('Отправление', datetime(2026, 3, 10, 6, 0)),
+                       ('Прибытие и заселение', datetime(2026, 3, 10, 11, 0)),
                        ('Командный ужин', datetime(2026, 3, 10, 18, 0))]
+        recipes = {r['name']: r for r in json.loads(
+            (ROOT / 'local_servers/kulinar-mcp/src/data/all_recipes.json').read_text())}
         workbook = openpyxl.Workbook()
         travel = workbook.active
         travel.title = 'Travel'
-        travel.append(['Train_No', 'Departure_Time'])
-        travel.append(['752А', '06:50'])
+        travel.append(['Train_No', 'Direction', 'Departure', 'Arrival', 'Duration_Min',
+                       'Seat_Class', 'Per_Person_RUB', 'Total_Budget_RUB'])
+        travel.append(['752А', 'Москва → Санкт-Петербург', '06:50', '10:50', 240, 'Эконом', 5500, 82500])
         menu = workbook.create_sheet('Menu')
-        menu.append(['Course_Type', 'Dish_Name'])
-        for row in [('салат', 'Винегрет'), ('суп', 'Борщ'), ('горячее', 'Бефстроганов'),
-                    ('гарнир', 'Картофельное пюре'), ('десерт', 'Сырники'), ('напиток', 'Морс клюквенный')]:
-            menu.append(row)
+        menu.append(['Course_Type', 'Dish_Name', 'Cook_Time_Min', 'Servings_Yield', 'Key_Ingredients', 'Notes'])
+        for name in ['Винегрет', 'Икра кабачковая', 'Бефстроганов', 'Котлеты домашние', 'Курица в сметане', 'Борщ']:
+            recipe = recipes[name]
+            course = 'Закуска' if recipe['category'] in {'закуска', 'салат'} else recipe['category']
+            menu.append([course, name, recipe['total_time_minutes'], recipe['servings'],
+                         ', '.join(item['name'] for item in recipe['ingredients']), ''])
         timeline = workbook.create_sheet('Timeline')
-        timeline.append(['Time', 'Activity'])
-        for row in [('06:20', 'Вокзал'), ('06:50', 'Отправление'), ('10:45', 'Прибытие'),
-                    ('12:00', 'Заселение'), ('18:00', 'Ужин')]:
-            timeline.append(row)
+        timeline.append(['Time', 'Activity', 'Location', 'Responsible_Person', 'Notes'])
+        for clock, activity, location in [('06:00', 'Дорога к вокзалу', 'Москва'), ('06:30', 'Посадка', 'Вокзал'),
+                ('11:00', 'Прибытие', 'СПб'), ('12:00', 'Заселение', 'Гостиница'),
+                ('18:00', 'Ужин', 'Ресторан'), ('20:30', 'Тимбилдинг', 'СПб')]:
+            timeline.append([clock, activity, location, 'Команда', ''])
         workbook.save(self.workspace / 'Team_Trip_Plan.xlsx')
 
     def test_catering_existing_valid_fixture_passes(self):

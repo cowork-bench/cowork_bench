@@ -26,6 +26,7 @@ from strands.agent.conversation_manager.summarizing_conversation_manager import 
 from strands.hooks import BeforeModelCallEvent, HookProvider, HookRegistry, MessageAddedEvent
 
 from utils.data_structures.task_config import TaskConfig
+from utils.task_runner.errors import PreprocessError
 from utils.general.helper import copy_folder_contents, print_color
 
 from .local_tools import build_local_tools
@@ -105,7 +106,7 @@ _INFRA_ERROR_MARKERS = (
 
 def _classify_error(exc: BaseException) -> "TaskStatus":
     """Separate infrastructure breakage from the model honestly failing."""
-    if _find_cause(exc, RecursionError) is not None:
+    if _find_cause(exc, (PreprocessError, RecursionError)) is not None:
         return TaskStatus.INFRA_ERROR
     msg = str(exc).lower()
     if any(m in msg for m in _INFRA_ERROR_MARKERS):
@@ -251,7 +252,7 @@ class StrandsTaskAgent:
         r = subprocess.run(cmd, shell=True, capture_output=not self.debug, text=True)
         if r.returncode != 0:
             print_color(f"[preprocess] failed:\n{r.stderr or ''}", "red")
-            raise RuntimeError(f"preprocess failed (exit {r.returncode})")
+            raise PreprocessError(f"preprocess failed (exit {r.returncode})")
         print_color("[preprocess] done.", "green")
 
     def _build_system_prompt(self, workspace: str) -> str:
