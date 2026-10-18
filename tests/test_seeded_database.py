@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import unittest
 import uuid
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,10 +37,17 @@ class SeededDatabaseTests(unittest.TestCase):
         self.addCleanup(connection.close)
         with connection.cursor() as cursor:
             expected, _ = grader.compute_expected(cursor)
-        for ticker, row in expected.items():
-            with self.subTest(ticker=ticker):
-                self.assertIsNotNone(row["current"])
-                self.assertEqual(row["current"], adapter.PgTicker(ticker).info["currentPrice"])
+        # The actual MCP launchers bridge libpq names to the adapter's PG_* names.
+        # Mirror only that environment setup; both sides run real database queries.
+        mcp_env = {"PG_HOST": os.environ.get("PGHOST", "localhost"),
+                   "PG_PORT": os.environ.get("PGPORT", "5432"),
+                   "PG_DATABASE": os.environ.get("PGDATABASE", "cowork_gym"),
+                   "PG_USER": "eigent", "PG_PASSWORD": "camel"}
+        with patch.dict(os.environ, mcp_env):
+            for ticker, row in expected.items():
+                with self.subTest(ticker=ticker):
+                    self.assertIsNotNone(row["current"])
+                    self.assertEqual(row["current"], adapter.PgTicker(ticker).info["currentPrice"])
         self.assertAlmostEqual(sum(row["alloc"] for row in expected.values()), 100.0)
 
     def test_hr_selects_five_unique_eligible_people_in_contract_order(self):
