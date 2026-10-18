@@ -36,6 +36,7 @@ CRITICAL_CHECKS = {
     "All five dishes exist in kulinar and difficulty <= 3",
     ">= 4 distinct categories incl. at least one soup and one vegetable",
     "No category repeated on consecutive days",
+    "Document reports the selected recipes correctly",
     "filtered_recipes.json valid (all diff<=3, contains the five dishes)",
     "memory.json: dietary_preferences + matching selections",
 }
@@ -102,28 +103,47 @@ DAY_LABELS = [
 ]
 
 
-def parse_docx_dishes(paragraphs):
-    """Парсит названия выбранных блюд из секций по дням.
-
-    Стратегия: разбиваем параграфы на блоки по заголовкам дней; внутри блока
-    ищем строку вида 'Блюдо: <name>' / 'Dish: <name>', иначе сопоставляем
-    любой kulinar-рецепт, чьё имя встречается в тексте блока.
-    Возвращает список (day_key, dish_name_or_None) по порядку дней.
-    """
-    texts = [p for p in paragraphs]
-    # locate index of each day's heading
+def day_blocks(paragraphs):
+    """Keep each day's artifact content together, in document order."""
     day_idx = []
-    for i, t in enumerate(texts):
-        low = t.strip().lower()
+    for i, text in enumerate(paragraphs):
+        low = text.strip().lower()
         for key, labels in DAY_LABELS:
             if any(low == lab or low.startswith(lab) for lab in labels):
                 day_idx.append((i, key))
                 break
-
     result = {}
     for j, (i, key) in enumerate(day_idx):
-        end = day_idx[j + 1][0] if j + 1 < len(day_idx) else len(texts)
-        block = texts[i:end]
+        end = day_idx[j + 1][0] if j + 1 < len(day_idx) else len(paragraphs)
+        result.setdefault(key, paragraphs[i:end])
+    return result
+
+
+def document_lines(doc):
+    """Read paragraphs and table cells in their actual document order."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    lines = []
+    for element in doc.element.body:
+        if element.tag.endswith("}p"):
+            lines.append(Paragraph(element, doc).text)
+        elif element.tag.endswith("}tbl"):
+            rows = [[cell.text for cell in row.cells] for row in Table(element, doc).rows]
+            field_names = {"категория", "category", "сложность", "difficulty", "ингредиенты", "ingredients"}
+            # A horizontal field/value table and a vertical two-column table
+            # express the same data; preserve that equivalence for parsing.
+            if rows and sum(_norm_name(v) in field_names for v in rows[0]) >= 2:
+                for row in rows[1:]:
+                    lines.extend(f"{label}: {value}" for label, value in zip(rows[0], row))
+            else:
+                lines.extend(" | ".join(row) for row in rows)
+    return lines
+
+
+def parse_docx_dishes(paragraphs):
+    """Resolve each day to an explicit dish label or a source recipe name."""
+    result = {}
+    for key, block in day_blocks(paragraphs).items():
         block_text = "\n".join(block)
         dish = None
         # explicit "Блюдо:" / "Dish:" line
@@ -146,6 +166,30 @@ def parse_docx_dishes(paragraphs):
             result[key] = dish
     # ordered by weekday sequence
     return [(key, result.get(key)) for key, _ in DAY_LABELS]
+
+
+def reported_recipe_matches(block, recipe):
+    """Check the report itself against source fields, not just its dish name.
+
+    Source ingredient names may be listed in paragraphs or tables. Accept common
+    label punctuation and numeric difficulty forms (including "2/5").
+    """
+    text = _norm_name("\n".join(block)).replace("ё", "е")
+    category = _norm_name(recipe["category"]).replace("ё", "е")
+    category_values = re.findall(
+        r"(?:категория(?: блюда)?|category)\s*[\"':|=—–-]*\s*([а-яa-z]+)", text)
+    category_ok = (all(value == category for value in category_values)
+                   if category_values else bool(re.search(r"\b" + re.escape(category) + r"\b", text)))
+    difficulty_values = re.findall(
+        r"(?:сложност[ьи](?: приготовления)?|difficulty)\s*[\"':|=—–-]*\s*(\d+)", text)
+    if not difficulty_values:
+        difficulty_values = re.findall(r"\b([1-5])\s*(?:/|из)\s*5\b", text)
+    difficulty_ok = bool(difficulty_values) and all(
+        int(value) == recipe["difficulty"] for value in difficulty_values)
+    ingredients_ok = all(
+        _norm_name(ingredient["name"]).replace("ё", "е") in text
+        for ingredient in recipe["ingredients"])
+    return category_ok and difficulty_ok and ingredients_ok
 
 
 def is_vegetable(recipe):
@@ -182,7 +226,7 @@ def main():
     try:
         from docx import Document
         doc = Document(docx_path)
-        all_paragraphs = [p.text for p in doc.paragraphs]
+        all_paragraphs = document_lines(doc)
         full_text = "\n".join(all_paragraphs)
         check("Weekly_Menu.docx exists and is readable", True)
     except Exception as e:
@@ -232,6 +276,13 @@ def main():
           all_known and all_easy,
           f"selected={[(d, n) for d, n in selected]}, unknown={unknown}, "
           f"difficulties={[(d, r.get('difficulty')) for d, r in resolved]}")
+
+    blocks = day_blocks(all_paragraphs)
+    incorrect_days = [day for day, recipe in resolved
+                      if not reported_recipe_matches(blocks.get(day, []), recipe)]
+    check("Document reports the selected recipes correctly",
+          all_known and not incorrect_days,
+          f"Wrong or missing category, difficulty or ingredient list: {incorrect_days}")
 
     # ---- CRITICAL 2: >=4 categories incl. soup + vegetable ----
     cats = [r.get("category") for _, r in resolved]
@@ -294,7 +345,10 @@ def main():
                 raw = f.read()
             try:
                 mem_data = json.loads(raw)
-                entities = mem_data.get("entities", [])
+                if isinstance(mem_data, dict) and mem_data.get("type") == "entity":
+                    entities = [mem_data]
+                else:
+                    entities = mem_data.get("entities", [])
             except json.JSONDecodeError:
                 # The issued memory MCP persists its graph as JSONL (one JSON
                 # object per line, type=="entity"/"relation"), not a single

@@ -2,16 +2,77 @@
   "review_doc": {
     "filename": "LLM_Reasoning_Review.docx",
     "required_headings": [
-      ["Introduction", "Введение"],
-      ["Chain-of-Thought", "Цепочка"],
-      ["Tree-Based", "Древовидн"],
-      ["Verification", "Верификация", "Верификации", "Reward"],
-      ["Summary Table", "Сводная таблица", "Сводная"],
-      ["Conclusion", "Заключение", "Выводы"]
+      [
+        "Introduction",
+        "Введение"
+      ],
+      [
+        "Chain-of-Thought",
+        "Цепочка"
+      ],
+      [
+        "Tree-Based",
+        "Древовидн"
+      ],
+      [
+        "Verification",
+        "Верификация",
+        "Верификации",
+        "Reward"
+      ],
+      [
+        "Summary Table",
+        "Сводная таблица",
+        "Сводная"
+      ],
+      [
+        "Conclusion",
+        "Заключение",
+        "Выводы"
+      ]
     ],
     "required_table_rows": 5,
-    "required_table_columns": ["Paper Title", "Year", "Key Method", "Main Result"],
-    "required_mentions": ["chain-of-thought", "self-consistency", "tree of thoughts", "RAP", "process supervision", "GSM8K", "MATH"]
+    "required_table_columns": [
+      "Paper Title",
+      "Year",
+      "Key Method",
+      "Main Result"
+    ],
+    "required_mentions": [
+      "chain-of-thought",
+      "self-consistency",
+      "tree of thoughts",
+      "RAP",
+      "process supervision",
+      "GSM8K",
+      "MATH"
+    ],
+    "required_result_facts": [
+      {
+        "benchmark": "GSM8K",
+        "value": 56.6
+      },
+      {
+        "benchmark": "GSM8K",
+        "value": 74.4
+      },
+      {
+        "benchmark": "Game of 24",
+        "value": 74
+      },
+      {
+        "benchmark": "Blocksworld",
+        "value": 64
+      },
+      {
+        "benchmark": "MATH",
+        "value": 78.2
+      },
+      {
+        "benchmark": "MATH",
+        "value": 72.4
+      }
+    ]
   },
   "slides": {
     "filename": "LLM_Reasoning_Slides.pptx",
@@ -20,14 +81,105 @@
       "Advances in LLM Reasoning",
       "Достижения в рассуждениях LLM"
     ],
-    "required_mentions": ["chain-of-thought", "tree of thoughts", "process supervision"]
+    "required_mentions": [
+      "chain-of-thought",
+      "tree of thoughts",
+      "process supervision"
+    ]
   },
   "word_count_file": "word_count.txt",
   "papers_used": [
-    {"arxiv_id": "2201.11903", "title_keyword": "Chain-of-Thought"},
-    {"arxiv_id": "2203.11171", "title_keyword": "Self-Consistency"},
-    {"arxiv_id": "2305.10601", "title_keyword": "Tree of Thoughts"},
-    {"arxiv_id": "2305.14992", "title_keyword": "Planning"},
-    {"arxiv_id": "2305.20050", "title_keyword": "Verify Step by Step"}
+    {
+      "arxiv_id": "2201.11903",
+      "title": "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models",
+      "years": [
+        2022
+      ],
+      "method_aliases": [
+        "chain-of-thought",
+        "CoT"
+      ],
+      "results": [
+        {
+          "benchmark": "GSM8K",
+          "value": 56.6
+        }
+      ]
+    },
+    {
+      "arxiv_id": "2203.11171",
+      "title": "Self-Consistency Improves Chain of Thought Reasoning in Language Models",
+      "years": [
+        2022,
+        2023
+      ],
+      "method_aliases": [
+        "self-consistency"
+      ],
+      "results": [
+        {
+          "benchmark": "GSM8K",
+          "value": 74.4
+        }
+      ]
+    },
+    {
+      "arxiv_id": "2305.10601",
+      "title": "Tree of Thoughts: Deliberate Problem Solving with Large Language Models",
+      "years": [
+        2023
+      ],
+      "method_aliases": [
+        "tree of thoughts",
+        "ToT"
+      ],
+      "results": [
+        {
+          "benchmark": "Game of 24",
+          "value": 74
+        }
+      ]
+    },
+    {
+      "arxiv_id": "2305.14992",
+      "title": "Reasoning with Language Model is Planning with World Model",
+      "years": [
+        2023
+      ],
+      "method_aliases": [
+        "RAP",
+        "planning",
+        "MCTS",
+        "Monte Carlo Tree Search"
+      ],
+      "results": [
+        {
+          "benchmark": "Blocksworld",
+          "value": 64
+        },
+        {
+          "benchmark": "GSM8K",
+          "value": 48.3
+        }
+      ]
+    },
+    {
+      "arxiv_id": "2305.20050",
+      "title": "Let's Verify Step by Step",
+      "years": [
+        2023
+      ],
+      "method_aliases": [
+        "process supervision",
+        "process-supervised",
+        "PRM"
+      ],
+      "results": [
+        {
+          "benchmark": "MATH",
+          "value": 78.2
+        }
+      ]
+    }
   ]
 }

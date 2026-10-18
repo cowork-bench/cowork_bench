@@ -16,6 +16,8 @@ async def main():
     parser.add_argument("--max_steps",  type=int, default=None)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--cn_mode", action="store_true")
+    parser.add_argument("--phase", choices=("all", "agent"), default="all",
+                        help="Container runners use agent; grading runs in a separate container.")
     args = parser.parse_args()
 
     cfg = read_json(args.eval_config)
@@ -56,6 +58,9 @@ async def main():
         debug=args.debug,
     )
     print_color(f"\n====== Status: {status.value} ======", "yellow")
+
+    if args.phase == "agent":
+        return 0 if status.value == "success" else 1
 
     print_color("\n====== Evaluating ======", "yellow")
     eval_res = await TaskEvaluator.evaluate_from_log_file(task_config.log_file)

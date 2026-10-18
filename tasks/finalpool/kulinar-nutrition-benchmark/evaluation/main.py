@@ -386,6 +386,12 @@ def main():
     parser.add_argument("--res_log_file", required=False)
     args = parser.parse_args()
 
+    # Validate mandatory artifacts before dependent checks can return early.
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
+
     benchmarks = load_benchmarks()
     if benchmarks is None:
         print("[warn] Could not load nutrition benchmarks (mock server + files unavailable)")

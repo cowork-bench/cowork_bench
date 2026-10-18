@@ -359,6 +359,12 @@ def main():
     parser.add_argument("--res_log_file", required=False)
     args = parser.parse_args()
 
+    # Validate mandatory artifacts before dependent checks can return early.
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
+
     gt = args.groundtruth_workspace or os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "groundtruth_workspace"

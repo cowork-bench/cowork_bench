@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 libpango-1.0-0 libcairo2 libasound2 \
     build-essential libffi-dev libssl-dev \
     libxml2-dev libxslt1-dev zlib1g-dev \
-    libreoffice-writer \
+    libreoffice-writer libreoffice-calc \
     && rm -rf /var/lib/apt/lists/*
 
 # uv
@@ -29,7 +29,7 @@ WORKDIR /workspace
 
 # Create venv OUTSIDE /workspace so it is not shadowed by the volume mount
 # camel-ai brings: openai, pyyaml, httpx, tiktoken, etc.
-RUN uv venv /opt/venv && uv pip install --python /opt/venv/bin/python \
+RUN uv venv --python 3.12.11 /opt/venv && uv pip install --python /opt/venv/bin/python \
     "camel-ai" \
     "anthropic" \
     "psycopg2-binary" \
@@ -65,8 +65,8 @@ RUN playwright install chromium || true
 COPY local_servers/ /opt/local_servers/
 RUN set -e; for dir in /opt/local_servers/*/; do \
     if [ -f "$dir/package.json" ]; then \
-        echo "=== NODE $dir ===" && cd "$dir" && npm install && \
-        if grep -q '"build"' package.json; then npm run build; fi && \
+        echo "=== NODE $dir ==="; cd "$dir"; npm install; \
+        if grep -q '"build"' package.json; then npm run build; fi; \
         cd /workspace; \
     fi; \
 done
@@ -76,7 +76,7 @@ done
 # using that MCP returned 0 tool calls.
 RUN set -e; for dir in /opt/local_servers/*/; do \
     if [ -f "$dir/pyproject.toml" ]; then \
-        echo "=== PY $dir ===" && cd "$dir" && uv sync && cd /workspace; \
+        echo "=== PY $dir ==="; cd "$dir"; uv sync --python 3.12.11; cd /workspace; \
     fi; \
 done
 

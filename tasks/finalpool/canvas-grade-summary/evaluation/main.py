@@ -5,6 +5,11 @@ import sys
 import openpyxl
 
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook
+from utils.evaluation.artifact_guards import require_gsheet
+
 def num_close(a, b, tol=1.0):
     if a is None and b is None:
         return True
@@ -62,8 +67,10 @@ def main():
         print(f"FAIL: Groundtruth not found: {gt_file}")
         sys.exit(1)
 
-    agent_wb = openpyxl.load_workbook(agent_file, data_only=True)
-    gt_wb = openpyxl.load_workbook(gt_file, data_only=True)
+    agent_wb = load_calculated_workbook(agent_file)
+    gt_wb = load_calculated_workbook(gt_file)
+
+    require_gsheet("Grade Summary Report", ())
 
     all_errors = []
     critical_failures = []
@@ -85,12 +92,12 @@ def main():
 
     a_sum_lookup = {}
     if a_sum:
-        for row in a_sum[1:]:
+        for row in a_sum:
             if row and row[0] is not None:
                 a_sum_lookup[str(row[0]).strip().lower()] = row
     g_sum_lookup = {}
     if g_sum:
-        for row in g_sum[1:]:
+        for row in g_sum:
             if row and row[0] is not None:
                 g_sum_lookup[str(row[0]).strip().lower()] = row
 

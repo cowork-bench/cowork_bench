@@ -79,7 +79,7 @@ def check_excel(agent_workspace):
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     except Exception as e:
-        record("Документ читается", False, str(e))
+        record("Документ читается", False, str(e), critical=True)
         return
     record("Документ читается", True)
 

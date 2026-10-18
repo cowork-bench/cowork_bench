@@ -38,15 +38,18 @@ KULINAR_JSON = os.path.join(
 
 CRITICAL_CHECKS = {
     "Excel file exists",
+    "Excel file readable",
+    "Dish Costs has required columns",
     "Dish Costs sheet exists",
     "Dish Costs has 5 data rows",
-    "Dishes are real kulinar recipes from >=3 categories",
+    "Dishes are real kulinar recipes from 5 categories",
+    "Ingredient_List matches the recipe ingredients with known prices",
     "Cost_Per_Serving == round(Total/4) for every dish",
     "Estimated_Total_Cost matches sum of matched ingredient prices",
     "Budget Summary aggregates correct",
     "Ingredient Prices: Price_Per_Unit matches grocery_prices.json",
     "Google Sheet 'Cafeteria Menu Cost Analysis' exists",
-    "Google Sheet reproduces Dish Costs dish names",
+    "Google Sheet reproduces all Dish Costs values",
 }
 
 PASS_COUNT = 0
@@ -86,17 +89,11 @@ def load_kulinar():
 
 
 def load_prices(agent_workspace):
-    """Load grocery_prices.json (prefer the copy in the agent workspace)."""
-    candidates = [
-        os.path.join(agent_workspace, "grocery_prices.json"),
-        os.path.join(os.path.dirname(__file__), "..", "initial_workspace", "grocery_prices.json"),
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8") as f:
-                rows = json.load(f)["prices"]
-            return {r["ingredient"]: r for r in rows}
-    return {}
+    """Use the immutable task input, never the agent-writable copy as an oracle."""
+    path = os.path.join(os.path.dirname(__file__), "..", "initial_workspace", "grocery_prices.json")
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)["prices"]
+    return {r["ingredient"]: r for r in rows}
 
 
 def sheet_rows(ws):
@@ -166,12 +163,29 @@ def check_excel(agent_workspace):
             for r in data[:5]:
                 dishes.append((r[ci_name], r[ci_ing], r[ci_tot], r[ci_cps]))
 
-            # (a) dishes are real kulinar recipes from >=3 distinct categories
+            # (a) dishes are real kulinar recipes from 5 distinct categories
             real = [d[0] for d in dishes if d[0] in by_name]
             cats = {name_to_cat[n] for n in real}
-            record("Dishes are real kulinar recipes from >=3 categories",
-                   len(real) == 5 and len(cats) >= 3,
+            record("Dishes are real kulinar recipes from 5 categories",
+                   len(real) == 5 and len(cats) == 5,
                    f"real={len(real)}/5, categories={sorted(cats)}")
+
+            mismatches = []
+            for dish_name, ingredient_list, _, _ in dishes:
+                if dish_name not in by_name:
+                    mismatches.append(str(dish_name))
+                    continue
+                expected_ingredients = {
+                    norm_name(item["name"]) for item in by_name[dish_name]["ingredients"]
+                    if item["name"] in price_map
+                }
+                actual_ingredients = {norm_name(item) for item in str(ingredient_list or "").split(",")
+                                      if norm_name(item)}
+                if actual_ingredients != expected_ingredients:
+                    mismatches.append(str(dish_name))
+            record("Ingredient_List matches the recipe ingredients with known prices",
+                   len(dishes) == 5 and not mismatches,
+                   f"Wrong ingredient lists: {mismatches}")
 
             # (b) Cost_Per_Serving == round(total/4, 2) recomputed from the row
             cps_ok = all(num_close(cps, round(float(tot) / 4, 2), 0.5)
@@ -304,25 +318,55 @@ def check_gsheet(dishes):
             target = spreadsheets[0]
 
         cur.execute("""
-            SELECT c.value
+            SELECT c.sheet_id, c.row_index, c.col_index, c.value
             FROM gsheet.cells c
             JOIN gsheet.sheets s ON c.sheet_id = s.id
             WHERE s.spreadsheet_id = %s
+            ORDER BY c.sheet_id, c.row_index, c.col_index
         """, (target[0],))
-        cells = [row[0] for row in cur.fetchall()]
+        cells = cur.fetchall()
         record("Google Sheet has data", len(cells) >= 5, f"Found {len(cells)} cells")
 
-        # Cross-source consistency: the 5 dish names from Dish Costs must appear
-        # among the Google Sheet cells.
-        all_text = " ".join(str(c) for c in cells if c is not None)
-        if dishes:
-            found = sum(1 for d in dishes
-                        if d[0] and str(d[0]).strip() and str(d[0]).strip() in all_text)
-            record("Google Sheet reproduces Dish Costs dish names", found >= 5,
-                   f"{found}/5 dish names found in gsheet")
-        else:
-            record("Google Sheet reproduces Dish Costs dish names", False,
-                   "no dish rows parsed from Excel")
+        # Match complete rows, preserving their sheet/row/column coordinates.
+        # Accept reordered columns and either 0- or 1-based cell coordinates.
+        sheets = {}
+        for sheet_id, ri, ci, value in cells:
+            sheets.setdefault(sheet_id, {}).setdefault(ri, {})[ci] = value
+        required = ("Dish_Name", "Ingredient_List", "Estimated_Total_Cost", "Cost_Per_Serving")
+        matched = False
+        for rows in sheets.values():
+            for header_row, header in rows.items():
+                columns = {norm_name(value): ci for ci, value in header.items()}
+                if not all(norm_name(name) in columns for name in required):
+                    continue
+                ci = [columns[norm_name(name)] for name in required]
+                actual = [tuple(row.get(col) for col in ci)
+                          for ri, row in sorted(rows.items()) if ri > header_row
+                          and any(row.get(col) not in (None, "") for col in ci)]
+                if len(actual) != len(dishes or []):
+                    continue
+                remaining = list(actual)
+                for expected in dishes or []:
+                    for index, row in enumerate(remaining):
+                        same_ingredients = (
+                            {norm_name(v) for v in str(row[1] or "").split(",")}
+                            == {norm_name(v) for v in str(expected[1] or "").split(",")}
+                        )
+                        if (norm_name(row[0]) == norm_name(expected[0]) and same_ingredients
+                                and num_close(row[2], expected[2], 0.01)
+                                and num_close(row[3], expected[3], 0.01)):
+                            remaining.pop(index)
+                            break
+                    else:
+                        break
+                else:
+                    matched = bool(dishes) and not remaining
+                if matched:
+                    break
+            if matched:
+                break
+        record("Google Sheet reproduces all Dish Costs values", matched,
+               "Expected the headers and all five complete rows from Dish Costs")
 
         cur.close(); conn.close()
     except Exception as e:

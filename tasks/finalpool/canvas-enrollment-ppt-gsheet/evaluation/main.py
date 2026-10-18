@@ -1,14 +1,19 @@
 """Evaluation for canvas-enrollment-ppt-gsheet.
 
 Blocking checks: Enrollment_Overview.xlsx and Enrollment_Overview.pptx.
-Non-blocking: Google Sheet DB check.
+Blocking: the required shared spreadsheet and its course data.
 """
 import argparse
 import os
 import sys
+import re
 import openpyxl
 from pptx import Presentation
 
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook
 
 def num_close(a, b, tol=1.0):
     if a is None and b is None:
@@ -34,6 +39,31 @@ def load_sheet_rows(wb, sheet_name):
     return None
 
 
+def slide_text(slide):
+    text = []
+    for shape in slide.shapes:
+        if shape.has_text_frame:
+            text.append(shape.text)
+        if shape.has_table:
+            text.extend(cell.text for row in shape.table.rows for cell in row.cells)
+        if shape.has_chart:
+            chart = shape.chart
+            text.extend(str(category.label) for category in chart.plots[0].categories)
+            for series in chart.series:
+                values = [value for value in series.values if value is not None]
+                text.extend(str(value) for value in values)
+                if (values and sum(values) and any(plot.has_data_labels and
+                        plot.data_labels.show_percentage for plot in chart.plots)):
+                    text.extend(str(round(value / sum(values) * 100, 1)) for value in values)
+    return " ".join(text).lower()
+
+
+def has_number(text, expected, tolerance=0.05):
+    text = re.sub(r"(?<=\d)[ \u00a0](?=\d{3}\b)", "", text)
+    return any(num_close(value.replace(",", "."), expected, tolerance)
+               for value in re.findall(r"\d+(?:[.,]\d+)?", text))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent_workspace", required=False, default=".")
@@ -56,8 +86,8 @@ def main():
     elif not os.path.exists(gt_excel):
         all_errors.append("Groundtruth Enrollment_Overview.xlsx not found")
     else:
-        agent_wb = openpyxl.load_workbook(agent_excel, data_only=True)
-        gt_wb = openpyxl.load_workbook(gt_excel, data_only=True)
+        agent_wb = load_calculated_workbook(agent_excel)
+        gt_wb = load_calculated_workbook(gt_excel)
 
         # Check Enrollment Details
         print("  Checking Enrollment Details...")
@@ -68,6 +98,11 @@ def main():
         elif g_rows is None:
             all_errors.append("Sheet 'Enrollment Details' not found in groundtruth")
         else:
+            required_headers = ["course_name", "course_code", "total_enrollments",
+                                "students", "teachers", "tas", "active", "completed"]
+            actual_headers = [str(v).strip().lower() for v in a_rows[0]]
+            if actual_headers[:8] != required_headers:
+                critical_errors.append("CRITICAL: Enrollment Details missing or reordered required columns")
             a_data = a_rows[1:] if len(a_rows) > 1 else []
             g_data = g_rows[1:] if len(g_rows) > 1 else []
             if abs(len(a_data) - len(g_data)) > 2:
@@ -88,6 +123,9 @@ def main():
                 a_row = a_lookup.get(key)
                 if a_row is None:
                     critical_errors.append(f"CRITICAL: Missing course: {g_row[0]} ({g_row[1]})")
+                    continue
+                if len(a_row) < 8:
+                    critical_errors.append(f"CRITICAL: {key} is missing required enrollment values")
                     continue
                 # Col 2: Total_Enrollments (CRITICAL, tight tol)
                 if len(a_row) > 2 and len(g_row) > 2:
@@ -173,115 +211,90 @@ def main():
         if len(slides) < 4:
             critical_errors.append(f"CRITICAL: PPT has {len(slides)} slides, expected at least 4")
         else:
-            # Check title slide
-            title_text = ""
-            for shape in slides[0].shapes:
-                if shape.has_text_frame:
-                    title_text += shape.text_frame.text.lower() + " "
-            if "enrollment" not in title_text:
-                all_errors.append(f"Title slide missing 'enrollment'. Found: {title_text[:100]}")
+            texts = [slide_text(slide) for slide in slides]
+            required_titles = ["course enrollment overview", "enrollment summary",
+                               "top 5 courses by enrollment", "enrollment distribution"]
+            for index, title in enumerate(required_titles):
+                if title not in texts[index]:
+                    critical_errors.append(f"CRITICAL: PPT slide {index + 1} missing title '{title}'")
+            if "academic dashboard report - 2026-03-06" not in texts[0]:
+                critical_errors.append("CRITICAL: PPT missing required subtitle")
 
-            # Check all PPT text for key content
-            all_ppt_text = ""
-            for slide in slides:
-                for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        all_ppt_text += shape.text_frame.text.lower() + " "
-
-            # CRITICAL: the four required slide titles must be present.
-            required_titles = [
-                "course enrollment overview",
-                "enrollment summary",
-                "top 5 courses by enrollment",
-                "enrollment distribution",
-            ]
-            for t in required_titles:
-                if t not in all_ppt_text:
-                    critical_errors.append(f"CRITICAL: PPT missing required slide title '{t}'")
-
-            if "distribution" not in all_ppt_text:
-                all_errors.append("PPT missing 'Distribution' slide")
-
-            # CRITICAL: Top-5 slide must list the actual top-5 course codes
-            # derived from the groundtruth Enrollment Details (code-based, not a
-            # single hardcoded course-name substring).
-            try:
-                gt_wb2 = openpyxl.load_workbook(gt_excel, data_only=True)
-                gt_det = load_sheet_rows(gt_wb2, "Enrollment Details")
-                ranked = []
-                for r in (gt_det[1:] if gt_det and len(gt_det) > 1 else []):
-                    if r and len(r) > 2 and r[1] is not None and r[2] is not None:
-                        try:
-                            ranked.append((str(r[1]).strip(), float(r[2])))
-                        except (TypeError, ValueError):
-                            pass
-                ranked.sort(key=lambda x: x[1], reverse=True)
-                top5_codes = [c.lower() for c, _ in ranked[:5]]
-                missing_codes = [c for c in top5_codes if c not in all_ppt_text]
-                if missing_codes:
-                    critical_errors.append(
-                        f"CRITICAL: PPT Top-5 slide missing course code(s): {missing_codes}")
-            except Exception as e:
-                all_errors.append(f"Could not derive top-5 from groundtruth: {e}")
+            gt_book = load_calculated_workbook(gt_excel)
+            details = load_sheet_rows(gt_book, "Enrollment Details")[1:]
+            metrics = {str(row[0]).lower(): row[1]
+                       for row in load_sheet_rows(gt_book, "Summary")[1:]}
+            for metric in ("total_courses", "total_enrollments", "total_students",
+                           "avg_enrollment_per_course"):
+                if not has_number(texts[1], metrics[metric]):
+                    critical_errors.append(f"CRITICAL: PPT summary missing {metric}")
+            for metric in ("largest_course", "smallest_course"):
+                if str(metrics[metric]).lower() not in texts[1]:
+                    critical_errors.append(f"CRITICAL: PPT summary missing {metric}")
+            for row in sorted(details, key=lambda row: float(row[2]), reverse=True)[:5]:
+                if (str(row[0]).lower() not in texts[2] or str(row[1]).lower() not in texts[2]
+                        or not has_number(texts[2], row[2], 0)):
+                    critical_errors.append(f"CRITICAL: PPT Top-5 missing course data for {row[1]}")
+            total = sum(float(row[2]) for row in details)
+            for index, label in ((3, "students"), (4, "teachers"), (5, "tas"),
+                                 (6, "active"), (7, "completed")):
+                count = sum(float(row[index]) for row in details)
+                percentage = round(count / total * 100, 1)
+                if not has_number(texts[3], percentage, 0.05):
+                    critical_errors.append(f"CRITICAL: PPT distribution missing {label} percentage")
 
         if not any("ppt" in e.lower() or "slide" in e.lower() for e in all_errors + critical_errors):
             print("    PASS")
 
-    # ---- GSheet check (non-critical: validated but reported as warnings only,
-    # since this eval is all-or-nothing and the spreadsheet is a secondary
-    # deliverable). ----
-    print("  Checking 'Enrollment Dashboard' Google Sheet (non-critical)...")
-    gsheet_warnings = []
-    required_cols = {"course_name", "course_code", "total_enrollments", "students",
-                     "teachers", "tas", "active", "completed"}
+    # The shared spreadsheet is a required deliverable, including course values.
+    print("  Checking 'Enrollment Dashboard' Google Sheet...")
+    import psycopg2
+    conn = None
     try:
-        import psycopg2
-        conn = psycopg2.connect(host=os.environ.get("PGHOST", "localhost"), port=5432, dbname="cowork_gym",
-                                user="eigent", password="camel")
+        conn = psycopg2.connect(host=os.environ.get("PGHOST", "localhost"), port=5432,
+                                dbname="cowork_gym", user="eigent", password="camel")
         cur = conn.cursor()
-        # Spreadsheet titled "Enrollment Dashboard"
         cur.execute("SELECT id FROM gsheet.spreadsheets WHERE lower(trim(title)) = %s",
                     ("enrollment dashboard",))
         ss = cur.fetchone()
         if not ss:
-            gsheet_warnings.append("GSheet 'Enrollment Dashboard' spreadsheet not found")
-        else:
-            ss_id = ss[0]
-            # Sheet named "Course Data"
-            cur.execute("SELECT id FROM gsheet.sheets WHERE spreadsheet_id = %s AND lower(trim(title)) = %s",
-                        (ss_id, "course data"))
-            sh = cur.fetchone()
-            if not sh:
-                gsheet_warnings.append("GSheet 'Course Data' sheet not found in 'Enrollment Dashboard'")
-            else:
-                sh_id = sh[0]
-                # Header row (smallest row_index) cells -> required columns present
-                cur.execute(
-                    "SELECT row_index, value FROM gsheet.cells WHERE sheet_id = %s ORDER BY row_index",
-                    (sh_id,))
-                rows = cur.fetchall()
-                if not rows:
-                    gsheet_warnings.append("GSheet 'Course Data' sheet has no cells")
-                else:
-                    header_row = rows[0][0]
-                    header = {str(v).strip().lower() for ri, v in rows
-                              if ri == header_row and v is not None}
-                    missing = required_cols - header
-                    if missing:
-                        gsheet_warnings.append(f"GSheet 'Course Data' missing columns: {sorted(missing)}")
+            raise ValueError("GSheet 'Enrollment Dashboard' spreadsheet not found")
+        cur.execute("SELECT id FROM gsheet.sheets WHERE spreadsheet_id = %s AND lower(trim(title)) = %s",
+                    (ss[0], "course data"))
+        sh = cur.fetchone()
+        if not sh:
+            raise ValueError("GSheet 'Course Data' sheet not found")
+        cur.execute("SELECT row_index, col_index, value FROM gsheet.cells "
+                    "WHERE spreadsheet_id = %s AND sheet_id = %s ORDER BY row_index, col_index",
+                    (ss[0], sh[0]))
+        grid = {}
+        for row_index, col_index, value in cur.fetchall():
+            grid.setdefault(row_index, {})[col_index] = value
+        if not grid:
+            raise ValueError("GSheet 'Course Data' has no cells")
+        header_row = min(grid)
+        header = {str(value).strip().lower(): index
+                  for index, value in grid[header_row].items()}
+        required = ["course_name", "course_code", "total_enrollments", "students",
+                    "teachers", "tas", "active", "completed"]
+        if set(required) - set(header):
+            raise ValueError("GSheet 'Course Data' missing required columns")
+        lookup = {str(row.get(header["course_code"], "")).strip().lower(): row
+                  for index, row in grid.items() if index != header_row}
+        for expected in load_sheet_rows(load_calculated_workbook(gt_excel), "Enrollment Details")[1:]:
+            key = str(expected[1]).strip().lower()
+            row = lookup.get(key)
+            if row is None or not str_match(row.get(header["course_name"]), expected[0]):
+                raise ValueError(f"GSheet missing or incorrect course {key}")
+            for index, column in enumerate(required[2:], 2):
+                if not num_close(row.get(header[column]), expected[index], 2):
+                    raise ValueError(f"GSheet {key}.{column} is incorrect")
         cur.close()
-        conn.close()
-    except Exception as e:
-        # Schema shape may vary across infra; do not hard-fail the whole eval on
-        # an introspection error for this non-critical deliverable.
-        print(f"    [INFO] GSheet check skipped: {e} (non-critical)")
-
-    if gsheet_warnings:
-        print(f"    [WARN] GSheet deliverable issues (non-critical): {len(gsheet_warnings)}")
-        for w in gsheet_warnings[:10]:
-            print(f"      {w}")
-    else:
-        print("    PASS")
+    except ValueError as exc:
+        critical_errors.append(f"CRITICAL: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     # ---- CRITICAL gate: any critical failure => immediate FAIL ----
     if critical_errors:

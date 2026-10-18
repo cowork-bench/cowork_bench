@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import sys
+import re
+from pathlib import Path
 
 import openpyxl
 import psycopg2
@@ -49,6 +51,8 @@ DETAILED_PRODUCTS = ["Alpha Pro", "Gamma Ultra", "Zeta Max"]
 CRITICAL_CHECKS = {
     "Product Listing data matches expected",
     "Detailed Analysis has 3 rows",
+    "Product features match API source",
+    "Detailed Analysis content matches API source",
     "Teamly page with 'Competitor' in title exists",
     "Teamly page mentions 10 products",
     "Teamly page mentions average price ~289",
@@ -82,10 +86,51 @@ def num_close(a, b, tol=1.0):
         return False
 
 
+def api_fixtures():
+    root = Path(__file__).resolve().parents[1] / "files" / "mock_api" / "api"
+    products = json.loads((root / "competitors.json").read_text(encoding="utf-8"))["competitors"]
+    details = [json.loads(path.read_text(encoding="utf-8"))
+               for path in sorted((root / "detail").glob("*.json"))]
+    return products, details
+
+
+def normalized_text(value):
+    return " ".join(str(value or "").casefold().split())
+
+
+def fixture_fields_match(rows, headers, expected, fields):
+    """Compare copied API fields; permit arbitrary row/column order and list separators."""
+    columns = {normalized_text(h): i for i, h in enumerate(headers)}
+    if any(field.lower() not in columns for field in ["Product", *fields]):
+        return False
+    def cell(row, field):
+        i = columns[field.lower()]
+        return row[i] if i < len(row) else None
+    actual = {normalized_text(cell(row, "Product")): row for row in rows}
+    if len(rows) != len(expected) or len(actual) != len(expected):
+        return False
+    for product in expected:
+        row = actual.get(normalized_text(product["name"]))
+        if row is None:
+            return False
+        for field in fields:
+            wanted = product[field.lower()]
+            got = normalized_text(cell(row, field))
+            if isinstance(wanted, list):
+                if not all(normalized_text(item) in got for item in wanted):
+                    return False
+            elif got != normalized_text(wanted):
+                return False
+    return True
+
+
 def check_excel(agent_workspace):
     print("\n=== Checking Excel Output ===")
+    products, details = api_fixtures()
     agent_file = os.path.join(agent_workspace, "Competitor_Analysis.xlsx")
     if not os.path.isfile(agent_file):
+        record("Product features match API source", False, "no excel")
+        record("Detailed Analysis content matches API source", False, "no excel")
         record("Excel file exists", False, f"Not found: {agent_file}")
         record("Product Listing data matches expected", False, "no excel")
         record("Detailed Analysis has 3 rows", False, "no excel")
@@ -96,6 +141,8 @@ def check_excel(agent_workspace):
         wb = openpyxl.load_workbook(agent_file, data_only=True)
     except Exception as e:
         record("Excel file readable", False, str(e))
+        record("Product features match API source", False, "unreadable")
+        record("Detailed Analysis content matches API source", False, "unreadable")
         record("Product Listing data matches expected", False, "unreadable")
         record("Detailed Analysis has 3 rows", False, "unreadable")
         return False
@@ -120,6 +167,7 @@ def check_excel(agent_workspace):
         all_ok = False
         listing_ok = False
         record("Product Listing data matches expected", False, "no sheet")
+        record("Product features match API source", False, "no sheet")
     else:
         record("Sheet 'Product Listing' exists", True)
         ws = wb[sheet_name]
@@ -149,17 +197,20 @@ def check_excel(agent_workspace):
                            "Missing from Product Listing")
                     listing_ok = False
                     continue
-                price_ok = num_close(row[1], expected["price"], tol=5.0)
+                price_ok = num_close(row[1], expected["price"], tol=1e-6)
                 if not price_ok:
                     record(f"{expected['name']} price", False,
                            f"Got {row[1]}, expected {expected['price']}")
                     listing_ok = False
-                rating_ok = num_close(row[2], expected["rating"], tol=0.2)
+                rating_ok = num_close(row[2], expected["rating"], tol=1e-6)
                 if not rating_ok:
                     record(f"{expected['name']} rating", False,
                            f"Got {row[2]}, expected {expected['rating']}")
                     listing_ok = False
 
+        features_ok = fixture_fields_match(data_rows, rows[0] if rows else [], products, ["Features"])
+        record("Product features match API source", features_ok)
+        all_ok = all_ok and features_ok
         # CRITICAL: semantic correctness of the fetched 10-product data.
         record("Product Listing data matches expected", listing_ok)
         if not listing_ok:
@@ -181,6 +232,7 @@ def check_excel(agent_workspace):
         record("Sheet 'Detailed Analysis' exists", False, f"Sheets found: {wb.sheetnames}")
         all_ok = False
         record("Detailed Analysis has 3 rows", False, "no sheet")
+        record("Detailed Analysis content matches API source", False, "no sheet")
     else:
         record("Sheet 'Detailed Analysis' exists", True)
         ws = wb[detail_sheet]
@@ -204,6 +256,11 @@ def check_excel(agent_workspace):
                 else:
                     record(f"Detailed Analysis contains {dp}", False, "Not found")
                     all_ok = False
+
+        details_ok = fixture_fields_match(data_rows, rows[0] if rows else [], details,
+                                          ["Description", "Pros", "Cons", "Target_Market"])
+        record("Detailed Analysis content matches API source", details_ok)
+        all_ok = all_ok and details_ok
 
         # Reverse: check no extra rows beyond 3
         if len(data_rows) > 3:
@@ -236,23 +293,15 @@ def _avg_price_present(text):
 
 def check_teamly():
     print("\n=== Checking Teamly ===")
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        # User-created pages only (global seed pages have id <= 3).
-        cur.execute(
-            "SELECT id, title, COALESCE(body, '') FROM teamly.pages WHERE id > 3"
-        )
-        pages = cur.fetchall()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        record("Teamly DB accessible", False, str(e))
-        record("Teamly page with 'Competitor' in title exists", False, str(e))
-        record("Teamly page mentions 10 products", False, str(e))
-        record("Teamly page mentions average price ~289", False, str(e))
-        record("Teamly page mentions Gamma Ultra", False, str(e))
-        return False
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    # User-created pages only (global seed pages have id <= 3).
+    cur.execute(
+        "SELECT id, title, COALESCE(body, '') FROM teamly.pages WHERE id > 3"
+    )
+    pages = cur.fetchall()
+    cur.close()
+    conn.close()
 
     all_ok = True
 
@@ -327,14 +376,23 @@ def check_memory(agent_workspace):
         return False
     record("Memory file is valid JSON", True)
 
-    content = json.dumps(data, ensure_ascii=False).lower()
-    has_notes = len(content) > 30
-    record("Memory file has been updated with notes", has_notes)
-    has_analysis = (
-        "analysis" in content or "competitor" in content or "complete" in content
-        or "анализ" in content or "конкурент" in content or "заверш" in content
-    )
-    record("Memory mentions analysis/competitor/complete", has_analysis)
+    notes = data.get("notes") if isinstance(data, dict) else None
+    content = json.dumps(notes, ensure_ascii=False).lower() if isinstance(notes, list) else ""
+    products, _details = api_fixtures()
+    observation = any(normalized_text(p["name"]) in content and (
+        str(p["price"]) in content or str(p["rating"]) in content
+        or any(normalized_text(feature) in content for feature in p["features"]))
+        for p in products)
+    # The task gives Gamma Ultra as an example, not the only valid observation.
+    observation = observation or ("gamma ultra" in content and any(
+        marker in content for marker in ("наивыс", "высоч", "лучши", "highest", "top rated")))
+    observation = observation or all(str(value) in content for value in
+                                     (min(p["price"] for p in products), max(p["price"] for p in products)))
+    has_notes = bool(notes) and bool(re.search(r"(?<!\d)10(?!\d)|десят", content)) and observation
+    has_analysis = any(marker in content for marker in
+                       ("analysis", "competitor", "анализ", "конкурент"))
+    record("Memory file has been updated with notes", has_notes and has_analysis,
+           "Expected notes array describing the ten-product analysis and an observation from source data")
     return has_notes and has_analysis
 
 

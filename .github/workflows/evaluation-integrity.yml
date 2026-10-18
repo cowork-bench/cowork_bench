@@ -1,0 +1,23 @@
+name: Evaluation integrity
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install model-free test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-calc rsync
+          python -m pip install openpyxl python-docx python-pptx psycopg2-binary termcolor pypdf
+      - name: Check runner syntax
+        run: bash -n run_parallel.sh scripts/run_containerized.sh
+      - name: Run regression suite
+        run: python -m unittest discover -s tests -v
