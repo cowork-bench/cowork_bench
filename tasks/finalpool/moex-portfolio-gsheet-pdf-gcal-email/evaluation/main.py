@@ -17,6 +17,7 @@ Sell (перевес); drift < -3 => Buy (недовес). Целевая дол
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -38,6 +39,8 @@ PASS_COUNT = 0
 FAIL_COUNT = 0
 CRITICAL_FAILS = []
 CRITICAL_CHECKS = {
+    "Portfolio dashboard exists with all three sheets",
+    "Portfolio numeric values match source",
     "Логика ребалансировки в Rebalancing согласована с правилом 3 п.п. (Action из drift)",
     "Holdings содержит ровно 5 тикеров MOEX с корректными RU-названиями и секторами; сумма долей ~100%",
     "Письмо Portfolio Drift Alert корректно перечисляет бумаги > 3 п.п. (или указывает, что таких нет)",
@@ -64,7 +67,8 @@ def safe_float(val, default=None):
     try:
         if val is None:
             return default
-        return float(str(val).replace(",", "").replace("%", "").replace("$", "").strip())
+        value = float(str(val).replace(",", "").replace("%", "").replace("$", "").strip())
+        return value if math.isfinite(value) else default
     except (ValueError, TypeError):
         return default
 
@@ -88,7 +92,14 @@ def compute_expected(cur):
         info = r[0] if r else {}
         if isinstance(info, str):
             info = json.loads(info)
-        current = info.get("currentPrice") or info.get("regularMarketPrice")
+        # Match PgTicker.info: currentPrice is the latest available close, not
+        # the older quote snapshot stored in stock_info.data.
+        cur.execute(
+            "SELECT close FROM moex.stock_prices WHERE symbol = %s "
+            "ORDER BY date DESC LIMIT 1", (t,))
+        latest = cur.fetchone()
+        current = latest[0] if latest and latest[0] is not None else (
+            info.get("currentPrice") or info.get("regularMarketPrice"))
         # цена покупки = закрытие на PURCHASE_DATE (или ближайшее <= даты)
         cur.execute(
             "SELECT close FROM moex.stock_prices WHERE symbol = %s AND date <= %s "
@@ -153,8 +164,38 @@ def check_xlsx(agent_workspace, expected):
     excel_path = os.path.join(agent_workspace, "Portfolio_Dashboard_Reference.xlsx")
     check("Portfolio_Dashboard_Reference.xlsx exists", os.path.exists(excel_path))
     if not os.path.exists(excel_path):
+        check("Portfolio dashboard exists with all three sheets", False, "missing workbook")
         return
     wb = openpyxl.load_workbook(excel_path)
+    complete = all(name in wb.sheetnames for name in ["Holdings", "Performance", "Rebalancing"])
+    check("Portfolio dashboard exists with all three sheets", complete)
+    numeric_ok = complete
+    field_map = {
+        "Holdings": {"Current_Price": ("current", 0.02), "Shares_Held": ("shares", 0.02),
+                     "Market_Value": ("market_value", 0.02), "Allocation_Pct": ("alloc", 0.11)},
+        "Performance": {"Purchase_Price": ("purchase", 0.02), "Current_Price": ("current", 0.02),
+                        "Return_Pct": ("ret", 0.02)},
+        "Rebalancing": {"Current_Allocation": ("alloc", 0.11), "Drift_Pct": ("drift", 0.11)},
+    }
+    for sheet, fields in field_map.items():
+        if sheet not in wb.sheetnames:
+            continue
+        _, data = sheet_to_dicts(wb[sheet])
+        by_symbol = {str(row.get("Symbol", "")).strip().upper(): row for row in data}
+        if len(data) != len(TICKERS) or set(by_symbol) != set(TICKERS):
+            numeric_ok = False
+        for ticker in TICKERS:
+            row = by_symbol.get(ticker, {})
+            for field, (source, tolerance) in fields.items():
+                value, target = safe_float(row.get(field)), expected[ticker][source]
+                if value is None or target is None or abs(value - target) > tolerance:
+                    numeric_ok = False
+            if sheet == "Performance" and str(row.get("Status", "")).casefold() != expected[ticker]["status"].casefold():
+                numeric_ok = False
+            if sheet == "Rebalancing" and safe_float(row.get("Target_Allocation")) != TARGET:
+                numeric_ok = False
+    check("Portfolio numeric values match source", numeric_ok)
+
     for sn in ["Holdings", "Performance", "Rebalancing"]:
         check(f"{sn} sheet exists", sn in wb.sheetnames)
 
@@ -247,12 +288,8 @@ def check_xlsx(agent_workspace, expected):
 
 
 def check_db(expected, need_rebal):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-    except Exception as e:
-        check("DB connection", False, str(e))
-        return
+    conn = get_conn()
+    cur = conn.cursor()
 
     # Google Sheet существование (структурно)
     cur.execute("SELECT COUNT(*) FROM gsheet.spreadsheets")
@@ -339,14 +376,10 @@ def run_evaluation(agent_workspace, groundtruth_workspace, launch_time, res_log_
     CRITICAL_FAILS = []
 
     # Пересчёт ожидаемого из живого источника moex.*
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        expected, need_rebal = compute_expected(cur)
-        conn.close()
-    except Exception as e:
-        check("moex source recompute", False, str(e))
-        expected, need_rebal = {t: {} for t in TICKERS}, []
+    conn = get_conn()
+    cur = conn.cursor()
+    expected, need_rebal = compute_expected(cur)
+    conn.close()
 
     check_xlsx(agent_workspace, expected)
 
@@ -383,6 +416,12 @@ def main():
     parser.add_argument("--launch_time", required=False, default="2026-03-07 10:00:00")
     parser.add_argument("--res_log_file", required=False)
     args = parser.parse_args()
+
+    # Validate mandatory artifacts before dependent checks can return early.
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
 
     success, message = run_evaluation(
         args.agent_workspace, args.groundtruth_workspace,

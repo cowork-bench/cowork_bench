@@ -1,0 +1,42 @@
+name: Evaluation integrity
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: eigent
+          POSTGRES_PASSWORD: camel
+          POSTGRES_DB: cowork_gym
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eigent -d cowork_gym"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      COWORK_TEST_PG: '1'
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGDATABASE: cowork_gym
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install model-free test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-calc rsync
+          python -m pip install openpyxl python-docx python-pptx psycopg2-binary termcolor pypdf pandas
+      - name: Restore disposable benchmark database
+        run: gzip -dc db/init.sql.gz | docker exec -i ${{ job.services.postgres.id }} psql -v ON_ERROR_STOP=1 -U eigent -d cowork_gym
+      - name: Check runner syntax
+        run: bash -n run_parallel.sh scripts/run_containerized.sh
+      - name: Run regression suite
+        run: python -m unittest discover -s tests -v

@@ -9,7 +9,7 @@
 #
 # Default runner: the baseline CAMEL agent (main.py). Plug in a custom engine
 # with AGENT_ENTRY=<path under /workspace>; set AGENT_PHASE_AWARE=1 if it
-# supports `--phase agent` / `--phase eval` to enable groundtruth isolation
+# supports `--phase agent` to enable groundtruth isolation
 # (agent runs on a sanitized task tree, grader runs separately with the answer
 # key present).
 #
@@ -68,9 +68,14 @@ ENTRY="$(resolve_entry)"
 PHASE_SPLIT=0
 [ "${AGENT_PHASE_AWARE:-}" = "1" ] && PHASE_SPLIT=1
 [ "$ENTRY" = "main_strands.py" ] && PHASE_SPLIT=1
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+[ "$ENTRY" = "main.py" ] && PHASE_SPLIT=1
+if [ "$PHASE_SPLIT" != "1" ]; then
+    echo "Custom engines must support --phase agent and set AGENT_PHASE_AWARE=1." >&2
+    exit 2
+fi
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)_$$"
 LOG_DIR="benchmark_logs/fully_parallel_${TIMESTAMP}"
-DOCKER=$(which docker 2>/dev/null || echo "/usr/local/bin/docker")
+DOCKER="${DOCKER:-$(command -v docker 2>/dev/null || echo /usr/local/bin/docker)}"
 
 mkdir -p "$LOG_DIR"
 
@@ -152,18 +157,19 @@ append_summary() {
     while ! mkdir "$SUMMARY_LOCK" 2>/dev/null; do sleep 0.1; done
     echo "$1" >> "$SUMMARY"
     # Recount from disk so progress reflects the real summary state.
-    local done_n pass_n eval_fail_n agent_fail_n other_n pct
+    local done_n pass_n eval_fail_n agent_fail_n other_n eval_error_n pct
     done_n=$(($(wc -l < "$SUMMARY") - 1))
     pass_n=$(awk -F, 'NR>1 && $3=="True"' "$SUMMARY" | wc -l | tr -d ' ')
     eval_fail_n=$(awk -F, 'NR>1 && $3=="False" && $2=="success"' "$SUMMARY" | wc -l | tr -d ' ')
-    agent_fail_n=$(awk -F, 'NR>1 && $2!="success" && $2!="pg_fail"' "$SUMMARY" | wc -l | tr -d ' ')
-    other_n=$(awk -F, 'NR>1 && $2=="pg_fail"' "$SUMMARY" | wc -l | tr -d ' ')
+    agent_fail_n=$(awk -F, 'NR>1 && $2!="success" && $2!="pg_fail" && $2!="evaluation_error" && $2!="infra_error"' "$SUMMARY" | wc -l | tr -d ' ')
+    eval_error_n=$(awk -F, 'NR>1 && $2=="evaluation_error"' "$SUMMARY" | wc -l | tr -d ' ')
+    other_n=$(awk -F, 'NR>1 && ($2=="pg_fail" || $2=="infra_error")' "$SUMMARY" | wc -l | tr -d ' ')
     if [ "$done_n" -gt 0 ]; then
         pct=$(awk -v p="$pass_n" -v d="$done_n" 'BEGIN{printf "%.1f", 100*p/d}')
     else
         pct="0.0"
     fi
-    echo "[$(date +%H:%M:%S)] [progress] ${done_n}/${TOTAL_TASKS} done | pass=${pass_n} (${pct}%) | eval_fail=${eval_fail_n} | agent_fail=${agent_fail_n} | pg_fail=${other_n}"
+    echo "[$(date +%H:%M:%S)] [progress] ${done_n}/${TOTAL_TASKS} done | pass=${pass_n} (${pct}%) | eval_fail=${eval_fail_n} | agent_fail=${agent_fail_n} | infra_fail=${other_n} | eval_error=${eval_error_n}"
     rmdir "$SUMMARY_LOCK"
 }
 
@@ -306,12 +312,14 @@ conn.close()
     # Code runs from the baked image; only data dirs are mounted (so each
     # container uses its own baked /workspace/.venv — no host race). The agent
     # gets a sanitized tasks tree when phase-aware (no answer key), else the full tree.
+    local ATTEMPT_DIR="$(pwd)/$LOG_DIR/artifacts/$TASK"
+    mkdir -p "$ATTEMPT_DIR"
     local STAGING="" ; local AGENT_TASK_MOUNT=()
     if [ "$PHASE_SPLIT" = "1" ]; then
         STAGING=$(mktemp -d "${TMPDIR:-/tmp}/cowork-stage-${TASK_ID}.XXXXXX")
         mkdir -p "$STAGING/tasks/finalpool/$TASK"
         rsync -a --exclude groundtruth_workspace --exclude groundtruth_workspace_cn \
-              --exclude evaluation \
+              --exclude evaluation --exclude '*groundtruth*' \
               "$(pwd)/tasks/finalpool/$TASK/" "$STAGING/tasks/finalpool/$TASK/" >> "$TASK_LOG" 2>&1
         # Writable: preprocess mock-servers write into the throwaway staging copy.
         AGENT_TASK_MOUNT=(-v "$STAGING/tasks:/workspace/tasks")
@@ -334,7 +342,7 @@ conn.close()
         -e MODEL_PROVIDER="$PROVIDER" \
         -e MODEL_NAME="$MODEL" \
         "${ENV_ARGS[@]}" \
-        -v "$(pwd)/dumps:/workspace/dumps" \
+        -v "$ATTEMPT_DIR:/workspace/dumps" \
         -v "$(pwd)/configs:/workspace/configs:ro" \
         "${AGENT_TASK_MOUNT[@]}" \
         -w /workspace \
@@ -347,17 +355,25 @@ conn.close()
     # LLM_*), so no --provider / --model_name args are needed.
     local PHASE_ARG=()
     [ "$PHASE_SPLIT" = "1" ] && PHASE_ARG=(--phase agent)
+    local AGENT_EXIT=0 AGENT_START=$(date +%s)
     $DOCKER exec \
         "$AGENT_CONTAINER" \
         timeout -k 30 "$TASK_TIMEOUT" /opt/venv/bin/python3 -u "/workspace/$ENTRY" \
             --task_dir "$TASK" \
             --max_steps "$MAX_STEPS" \
             "${PHASE_ARG[@]}" \
-        >> "$TASK_LOG" 2>&1 || true
+        >> "$TASK_LOG" 2>&1 || AGENT_EXIT=$?
+
+    local TIMED_OUT=()
+    if [ "$AGENT_EXIT" = "124" ] || { [ "$AGENT_EXIT" = "137" ] && [ "$(($(date +%s) - AGENT_START))" -ge "$TASK_TIMEOUT" ]; }; then
+        TIMED_OUT=(--timed-out)
+    fi
 
     # --- Eval phase (isolated): separate container WITH the groundtruth ---
     if [ "$PHASE_SPLIT" = "1" ]; then
         $DOCKER rm -fv "$AGENT_CONTAINER" >> "$TASK_LOG" 2>&1 || true
+        # Fresh attempt: discard any verdict planted during the agent phase.
+        find "$ATTEMPT_DIR" -name eval_res.json -delete
         $DOCKER run -d \
             --name "$EVAL_CONTAINER" \
             --network "$NET_NAME" \
@@ -371,7 +387,7 @@ conn.close()
             -e PYTHON_BIN=/opt/venv/bin/python3 \
             -e MODEL_PROVIDER="$PROVIDER" \
             -e MODEL_NAME="$MODEL" \
-            -v "$(pwd)/dumps:/workspace/dumps" \
+            -v "$ATTEMPT_DIR:/workspace/dumps" \
             -v "$(pwd)/tasks:/workspace/tasks:ro" \
             -v "$(pwd)/configs:/workspace/configs:ro" \
             -w /workspace \
@@ -379,48 +395,18 @@ conn.close()
         sleep 1
         $DOCKER exec \
             "$EVAL_CONTAINER" \
-            /opt/venv/bin/python3 -u "/workspace/$ENTRY" \
-                --task_dir "$TASK" \
-                --phase eval \
+            env PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \
+                --task_dir "$TASK" --dumps_dir /workspace/dumps \
             >> "$TASK_LOG" 2>&1 || true
     fi
 
     local END_TS=$(date +%s)
     local DURATION=$((END_TS - START_TS))
 
-    # --- Parse results ---
-    # The task log interleaves the harness's own lines with the model's streamed
-    # output, so an unanchored grep lets model-authored text decide the verdict.
-    # Read the grader's own artifact where it exists, and anchor every fallback.
-    local STATUS="unknown" EVAL_PASS="null"
-    if grep -qE "^=+ Status: success =+$" "$TASK_LOG" 2>/dev/null; then
-        STATUS="success"
-    elif grep -qE "^=+ Status: failed =+$" "$TASK_LOG" 2>/dev/null; then
-        STATUS="failed"
-    elif grep -qE "^=+ Status: (max_turns_reached|infra_error|interrupted) =+$" "$TASK_LOG" 2>/dev/null; then
-        STATUS=$(sed -nE 's/^=+ Status: ([a-z_]+) =+$/\1/p' "$TASK_LOG" | tail -1)
-    fi
-
-    if [ "$STATUS" = "success" ]; then
-        # eval_res.json is written by the grader itself. Only trust one produced by
-        # THIS run — dumps/ is reused across runs of the same task.
-        local EVAL_JSON
-        EVAL_JSON=$(ls -t dumps/*/SingleUserTurn-"${TASK}"/eval_res.json 2>/dev/null | head -1)
-        if [ -n "$EVAL_JSON" ] && [ "$(stat -f %m "$EVAL_JSON" 2>/dev/null || stat -c %Y "$EVAL_JSON" 2>/dev/null || echo 0)" -ge "$START_TS" ]; then
-            case "$(sed -nE 's/.*"pass"[[:space:]]*:[[:space:]]*(true|false|null).*/\1/p' "$EVAL_JSON" | head -1)" in
-                true)  EVAL_PASS="True" ;;
-                false) EVAL_PASS="False" ;;
-            esac
-        fi
-        # Fallback: the runner's own summary line, anchored to line start.
-        if [ "$EVAL_PASS" = "null" ]; then
-            if grep -qE "^Pass:[[:space:]]+True$" "$TASK_LOG" 2>/dev/null; then
-                EVAL_PASS="True"
-            elif grep -qE "^Pass:[[:space:]]+False$" "$TASK_LOG" 2>/dev/null; then
-                EVAL_PASS="False"
-            fi
-        fi
-    fi
+    # Only this fresh attempt's native artifacts determine the verdict.
+    # No shared dumps search, platform-specific stat or streamed-text fallback.
+    local STATUS="evaluation_error" EVAL_PASS="null"
+    read -r STATUS EVAL_PASS < <(python3 scripts/read_attempt_result.py "$ATTEMPT_DIR" "$TASK" --agent-exit "$AGENT_EXIT" ${TIMED_OUT[@]+"${TIMED_OUT[@]}"}) || { STATUS="evaluation_error"; EVAL_PASS="null"; }
 
     append_summary "${TASK},${STATUS},${EVAL_PASS},${DURATION}"
 
@@ -428,6 +414,8 @@ conn.close()
     local RESULT="AGENT_FAIL"
     if [ "$EVAL_PASS" = "True" ]; then
         RESULT="PASS"
+    elif [ "$STATUS" = "evaluation_error" ]; then
+        RESULT="EVAL_ERROR"
     elif [ "$STATUS" = "success" ]; then
         RESULT="EVAL_FAIL"
     fi
@@ -479,7 +467,12 @@ import sys, csv, json, os
 
 summary_file = sys.argv[1]
 log_dir = sys.argv[2]
-pass_count = eval_fail = agent_fail = other = 0
+try:
+    with open(os.path.join(log_dir, "run_meta.json")) as f:
+        m = json.load(f)
+except (OSError, ValueError):
+    m = {}
+pass_count = eval_fail = agent_fail = other = eval_error = 0
 total_duration = 0
 results = []
 
@@ -495,11 +488,14 @@ with open(summary_file) as f:
         if eval_pass == "True":
             label = "PASS"
             pass_count += 1
+        elif status == "evaluation_error":
+            label = "EVAL_ERROR"
+            eval_error += 1
         elif status == "success":
             label = "EVAL_FAIL"
             eval_fail += 1
-        elif status == "pg_fail":
-            label = "PG_FAIL"
+        elif status in ("pg_fail", "infra_error"):
+            label = "INFRA_ERROR"
             other += 1
         else:
             label = "AGENT_FAIL"
@@ -510,10 +506,17 @@ with open(summary_file) as f:
 for task, label, dur in sorted(results):
     print(f"  {task:<55s} {label:<12s} ({dur}s)")
 
-total = pass_count + eval_fail + agent_fail + other
+total = pass_count + eval_fail + agent_fail + other + eval_error
+coverage_complete = total == m.get("total_tasks") and len({r[0] for r in results}) == total
+print(f"Coverage: {total}/{m.get('total_tasks', 'unknown')}")
+print(f"Evaluation errors (unscored): {eval_error}")
 print()
 if total > 0:
-    print(f"  PASS:       {pass_count:4d}  ({100*pass_count/total:.1f}%)")
+    print(f"  PASS:       {pass_count:4d}")
+    if other or eval_error or not coverage_complete:
+        print("  Benchmark score: unavailable (unscored errors or incomplete coverage)")
+    else:
+        print(f"  Benchmark score: {100*pass_count/total:.1f}%")
     print(f"  EVAL_FAIL:  {eval_fail:4d}  ({100*eval_fail/total:.1f}%)")
     print(f"  AGENT_FAIL: {agent_fail:4d}  ({100*agent_fail/total:.1f}%)")
     if other:
@@ -524,13 +527,8 @@ else:
     print("  No results.")
 
 # Append aggregate to central index (one row per run; params from run_meta.json)
-try:
-    with open(os.path.join(log_dir, "run_meta.json")) as f:
-        m = json.load(f)
-except (OSError, ValueError):
-    m = {}
 llm = m.get("llm", {})
-pass_pct = round(100 * pass_count / total, 1) if total else 0.0
+pass_pct = round(100 * pass_count / total, 1) if total and coverage_complete and not (other or eval_error) else ""
 index = os.path.join(os.path.dirname(log_dir) or ".", "index.csv")
 cols = ["timestamp", "model", "model_quant", "reasoning_effort", "max_concurrent",
         "total", "pass", "pass_pct", "eval_fail", "agent_fail", "other",
@@ -539,7 +537,7 @@ row = {
     "timestamp": m.get("timestamp", ""), "model": m.get("model", ""),
     "model_quant": m.get("model_quant", ""), "reasoning_effort": llm.get("reasoning_effort", ""),
     "max_concurrent": m.get("max_concurrent", ""), "total": total, "pass": pass_count,
-    "pass_pct": pass_pct, "eval_fail": eval_fail, "agent_fail": agent_fail, "other": other,
+    "pass_pct": pass_pct, "eval_fail": eval_fail, "agent_fail": agent_fail, "other": other + eval_error,
     "idle_timeout": llm.get("stream_idle_timeout", ""), "context_window": llm.get("context_window", ""),
     "image": m.get("image", ""), "notes": m.get("notes", ""), "log_dir": log_dir,
 }

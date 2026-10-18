@@ -26,6 +26,7 @@ import re
 import sys
 from argparse import ArgumentParser
 from datetime import datetime
+from collections import Counter
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
@@ -36,6 +37,8 @@ CRITICAL_CHECKS = {
     "All five dishes exist in kulinar and difficulty <= 3",
     ">= 4 distinct categories incl. at least one soup and one vegetable",
     "No category repeated on consecutive days",
+    "Document reports the selected recipes correctly",
+    "Recipe JSON inputs are complete and consistent with source and difficulty filter",
     "filtered_recipes.json valid (all diff<=3, contains the five dishes)",
     "memory.json: dietary_preferences + matching selections",
 }
@@ -102,28 +105,47 @@ DAY_LABELS = [
 ]
 
 
-def parse_docx_dishes(paragraphs):
-    """Парсит названия выбранных блюд из секций по дням.
-
-    Стратегия: разбиваем параграфы на блоки по заголовкам дней; внутри блока
-    ищем строку вида 'Блюдо: <name>' / 'Dish: <name>', иначе сопоставляем
-    любой kulinar-рецепт, чьё имя встречается в тексте блока.
-    Возвращает список (day_key, dish_name_or_None) по порядку дней.
-    """
-    texts = [p for p in paragraphs]
-    # locate index of each day's heading
+def day_blocks(paragraphs):
+    """Keep each day's artifact content together, in document order."""
     day_idx = []
-    for i, t in enumerate(texts):
-        low = t.strip().lower()
+    for i, text in enumerate(paragraphs):
+        low = text.strip().lower()
         for key, labels in DAY_LABELS:
             if any(low == lab or low.startswith(lab) for lab in labels):
                 day_idx.append((i, key))
                 break
-
     result = {}
     for j, (i, key) in enumerate(day_idx):
-        end = day_idx[j + 1][0] if j + 1 < len(day_idx) else len(texts)
-        block = texts[i:end]
+        end = day_idx[j + 1][0] if j + 1 < len(day_idx) else len(paragraphs)
+        result.setdefault(key, paragraphs[i:end])
+    return result
+
+
+def document_lines(doc):
+    """Read paragraphs and table cells in their actual document order."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    lines = []
+    for element in doc.element.body:
+        if element.tag.endswith("}p"):
+            lines.append(Paragraph(element, doc).text)
+        elif element.tag.endswith("}tbl"):
+            rows = [[cell.text for cell in row.cells] for row in Table(element, doc).rows]
+            field_names = {"категория", "category", "сложность", "difficulty", "ингредиенты", "ingredients"}
+            # A horizontal field/value table and a vertical two-column table
+            # express the same data; preserve that equivalence for parsing.
+            if rows and sum(_norm_name(v) in field_names for v in rows[0]) >= 2:
+                for row in rows[1:]:
+                    lines.extend(f"{label}: {value}" for label, value in zip(rows[0], row))
+            else:
+                lines.extend(" | ".join(row) for row in rows)
+    return lines
+
+
+def parse_docx_dishes(paragraphs):
+    """Resolve each day to an explicit dish label or a source recipe name."""
+    result = {}
+    for key, block in day_blocks(paragraphs).items():
         block_text = "\n".join(block)
         dish = None
         # explicit "Блюдо:" / "Dish:" line
@@ -146,6 +168,96 @@ def parse_docx_dishes(paragraphs):
             result[key] = dish
     # ordered by weekday sequence
     return [(key, result.get(key)) for key, _ in DAY_LABELS]
+
+
+def reported_recipe_matches(block, recipe):
+    """Check the report itself against source fields, not just its dish name.
+
+    Source ingredient names may be listed in paragraphs or tables. Accept common
+    label punctuation and numeric difficulty forms (including "2/5").
+    """
+    text = _norm_name("\n".join(block)).replace("ё", "е")
+    category = _norm_name(recipe["category"]).replace("ё", "е")
+    category_values = re.findall(
+        r"(?:категория(?: блюда)?|category)\s*[\"':|=—–-]*\s*([а-яa-z]+)", text)
+    category_ok = (all(value == category for value in category_values)
+                   if category_values else bool(re.search(r"\b" + re.escape(category) + r"\b", text)))
+    difficulty_values = re.findall(
+        r"(?:сложност[ьи](?: приготовления)?|difficulty)\s*[\"':|=—–-]*\s*(\d+)", text)
+    if not difficulty_values:
+        difficulty_values = re.findall(r"\b([1-5])\s*(?:/|из)\s*5\b", text)
+    difficulty_ok = bool(difficulty_values) and all(
+        int(value) == recipe["difficulty"] for value in difficulty_values)
+    ingredients_ok = all(
+        _norm_name(ingredient["name"]).replace("ё", "е") in text
+        for ingredient in recipe["ingredients"])
+    return category_ok and difficulty_ok and ingredients_ok
+
+
+
+def recipe_json_inputs_valid(workspace, selected_names):
+    """Validate required saved records, independent of the report's prose."""
+    def validate(records):
+        if not isinstance(records, list) or not records:
+            raise ValueError("recipe records must be a nonempty JSON array")
+        names = []
+        for record in records:
+            if not isinstance(record, dict) or not {"name", "category", "difficulty", "ingredients"} <= set(record):
+                raise ValueError("a recipe is missing name/category/difficulty/ingredients")
+            name = _norm_name(record["name"])
+            reference = KULINAR_BY_NAME.get(name)
+            if (reference is None or _norm_name(record["category"]) != _norm_name(reference["category"])
+                    or record["difficulty"] != reference["difficulty"]):
+                raise ValueError("recipe name, category or difficulty disagrees with source")
+            reference_ingredients = {_norm_name(item["name"]): item for item in reference["ingredients"]}
+            ingredients = record["ingredients"]
+            if isinstance(ingredients, str):
+                ingredients = re.split(r"[,;\n]", ingredients)
+            if not isinstance(ingredients, list) or not ingredients:
+                raise ValueError("ingredients must list the recipe's ingredients")
+            actual = set()
+            for item in ingredients:
+                if isinstance(item, dict):
+                    ingredient_name = _norm_name(item.get("name", ""))
+                    if ingredient_name not in reference_ingredients:
+                        raise ValueError("unknown ingredient")
+                    source_item = reference_ingredients[ingredient_name]
+                    if "quantity" in item:
+                        actual_quantity, expected_quantity = item["quantity"], source_item.get("quantity")
+                        if expected_quantity is None:
+                            equal_quantity = actual_quantity in (None, "", "по вкусу")
+                        else:
+                            try:
+                                equal_quantity = float(actual_quantity) == float(expected_quantity)
+                            except (ValueError, TypeError):
+                                equal_quantity = actual_quantity == expected_quantity
+                        if not equal_quantity:
+                            raise ValueError("ingredient quantity disagrees with source")
+                    if "unit" in item and _norm_name(item["unit"] or "") != _norm_name(source_item.get("unit") or ""):
+                        raise ValueError("ingredient unit disagrees with source")
+                else:
+                    text = _norm_name(item)
+                    matches = [key for key in reference_ingredients if key in text]
+                    if not matches:
+                        raise ValueError("unknown ingredient text")
+                    ingredient_name = max(matches, key=len)
+                actual.add(ingredient_name)
+            if actual != set(reference_ingredients):
+                raise ValueError("ingredient list is incomplete")
+            names.append(name)
+        return names
+    try:
+        with open(os.path.join(workspace, "all_recipes.json"), encoding="utf-8") as file:
+            all_records = json.load(file)
+        with open(os.path.join(workspace, "filtered_recipes.json"), encoding="utf-8") as file:
+            filtered_records = json.load(file)
+        all_names = validate(all_records)
+        filtered_names = validate(filtered_records)
+        expected = Counter(_norm_name(record["name"]) for record in all_records if record["difficulty"] <= 3)
+        return (Counter(filtered_names) == expected and
+                {_norm_name(name) for name in selected_names} <= set(filtered_names)), ""
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return False, str(exc)
 
 
 def is_vegetable(recipe):
@@ -182,7 +294,7 @@ def main():
     try:
         from docx import Document
         doc = Document(docx_path)
-        all_paragraphs = [p.text for p in doc.paragraphs]
+        all_paragraphs = document_lines(doc)
         full_text = "\n".join(all_paragraphs)
         check("Weekly_Menu.docx exists and is readable", True)
     except Exception as e:
@@ -233,6 +345,13 @@ def main():
           f"selected={[(d, n) for d, n in selected]}, unknown={unknown}, "
           f"difficulties={[(d, r.get('difficulty')) for d, r in resolved]}")
 
+    blocks = day_blocks(all_paragraphs)
+    incorrect_days = [day for day, recipe in resolved
+                      if not reported_recipe_matches(blocks.get(day, []), recipe)]
+    check("Document reports the selected recipes correctly",
+          all_known and not incorrect_days,
+          f"Wrong or missing category, difficulty or ingredient list: {incorrect_days}")
+
     # ---- CRITICAL 2: >=4 categories incl. soup + vegetable ----
     cats = [r.get("category") for _, r in resolved]
     distinct_cats = set(cats)
@@ -281,6 +400,10 @@ def main():
     check("filtered_recipes.json valid (all diff<=3, contains the five dishes)",
           all_known and filt_ok, filt_detail)
 
+    inputs_ok, inputs_detail = recipe_json_inputs_valid(agent_ws, [name for _, name in selected])
+    check("Recipe JSON inputs are complete and consistent with source and difficulty filter",
+          inputs_ok, inputs_detail)
+
     # ---- CRITICAL 5: memory.json dietary_preferences + matching selections ----
     memory_path = os.path.join(agent_ws, "memory", "memory.json")
     mem_struct_ok = False
@@ -294,7 +417,10 @@ def main():
                 raw = f.read()
             try:
                 mem_data = json.loads(raw)
-                entities = mem_data.get("entities", [])
+                if isinstance(mem_data, dict) and mem_data.get("type") == "entity":
+                    entities = [mem_data]
+                else:
+                    entities = mem_data.get("entities", [])
             except json.JSONDecodeError:
                 # The issued memory MCP persists its graph as JSONL (one JSON
                 # object per line, type=="entity"/"relation"), not a single

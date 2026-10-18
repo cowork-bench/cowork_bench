@@ -344,6 +344,12 @@ def main():
     parser.add_argument("--res_log_file", required=False)
     args = parser.parse_args()
 
+    # Validate mandatory artifacts before dependent checks can return early.
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
+
     refund_rows, product_refund_map, investigation_products = get_expected_data()
     print(f"Expected {len(refund_rows)} refunds, {len(product_refund_map)} products, "
           f"{len(investigation_products)} requiring investigation")

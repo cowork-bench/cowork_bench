@@ -5,7 +5,7 @@ description = "1С:ЗУП-подобный HR MCP-сервер (российск
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp==1.23.1",
     "pandas>=2.2.3",
     "python-dotenv>=1.0.1",
     "sqlparse>=0.5.3",

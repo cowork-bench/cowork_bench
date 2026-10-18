@@ -102,7 +102,9 @@ class Evaluation:
 
         if evaluation_command_path.exists():
             python_bin = os.environ.get("PYTHON_BIN", "python3")
-            evaluation_command = f"{python_bin} -m {path_to_module(evaluation_command_path)}"
+            import shlex
+            evaluation_command = (f"{shlex.quote(python_bin)} -m utils.evaluation.grade_process "
+                                  f"--module {shlex.quote(path_to_module(evaluation_command_path))}")
         else:
             evaluation_command = None
         if groundtruth_workspace_path.exists():

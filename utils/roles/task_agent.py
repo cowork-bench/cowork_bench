@@ -13,6 +13,7 @@ from utils.aux_tools.basic import make_claim_done, sleep
 from utils.aux_tools.overlong_tool_manager import make_overlong_tools
 from utils.aux_tools.python_interpretor import make_python_execute
 from utils.data_structures.task_config import TaskConfig
+from utils.task_runner.errors import PreprocessError
 from utils.general.helper import copy_folder_contents, print_color
 from utils.mcp.tool_servers import build_mcp_clients
 from utils.api_model.model_provider import resolve_provider
@@ -23,6 +24,7 @@ class TaskStatus(Enum):
     FAILED = "failed"
     MAX_TURNS_REACHED = "max_turns_reached"
     INTERRUPTED = "interrupted"
+    INFRA_ERROR = "infra_error"
 
 
 async def _noop(*args, **kwargs) -> str:
@@ -211,7 +213,7 @@ class TaskAgent:
                 print_color("[preprocess] running...", "yellow")
                 r = subprocess.run(cmd, shell=True, capture_output=not self.debug, text=True)
                 if r.returncode != 0:
-                    print_color(f"[preprocess] failed: {(r.stderr or '')[:300]}", "red")
+                    raise PreprocessError(f"preprocess exited {r.returncode}: {(r.stderr or '')[:1000]}")
                 else:
                     print_color("[preprocess] done.", "green")
 
@@ -413,6 +415,9 @@ class TaskAgent:
 
         except KeyboardInterrupt:
             status = TaskStatus.INTERRUPTED
+        except PreprocessError as e:
+            status = TaskStatus.INFRA_ERROR
+            print_color(f"[preprocess] Error: {e}", "red")
         except Exception as e:
             print_color(f"[agent] Error: {e}", "red")
             if self.debug:

@@ -69,7 +69,7 @@ fi
 # ---------------------------------------------------------------------------
 # Container naming
 # ---------------------------------------------------------------------------
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)-$$"
 SAFE_TASK="$(echo "$TASK" | tr '/' '-')"
 # Two ephemeral containers per run (groundtruth isolation):
 #   AGENT_CONTAINER — runs the LLM agent; mounts a SANITIZED task tree WITHOUT
@@ -324,8 +324,11 @@ ENTRY="$(resolve_entry)"
 # automatically — README documents exactly this, but the code used to gate on
 # AGENT_PHASE_AWARE alone and silently ran the agent with the answer key mounted.
 PHASE_SPLIT=0
-if [[ "${AGENT_PHASE_AWARE:-}" == "1" || "$ENTRY" == "main_strands.py" ]]; then
+if [[ "${AGENT_PHASE_AWARE:-}" == "1" || "$ENTRY" == "main_strands.py" || "$ENTRY" == "main.py" ]]; then
     PHASE_SPLIT=1
+fi
+if [[ "$PHASE_SPLIT" != "1" ]]; then
+    die "Custom engines must support --phase agent and set AGENT_PHASE_AWARE=1."
 fi
 
 run_agent_phase() {
@@ -363,7 +366,7 @@ run_eval_phase() {
     # traj_log.json under /workspace/dumps, grades against groundtruth.
     docker exec -e PYTHONPATH=/workspace "$EVAL_CONTAINER" \
         /opt/venv/bin/python3 scripts/run_eval.py \
-            --dumps_dir /workspace/dumps \
+            --dumps_dir /workspace/dumps --task_dir "$TASK" \
         2>&1 | tee "$OUTPUT_DIR/eval.log"
 }
 
@@ -387,9 +390,10 @@ if [[ "$PHASE_SPLIT" == "1" ]]; then
     build_staging sanitize
     start_container "$AGENT_CONTAINER" "$STAGING_DIR/tasks" rw
     wait_for_container "$AGENT_CONTAINER"
-    run_agent_phase
+    run_agent_phase || warn "Agent phase returned nonzero; preserving native status for evaluation."
     docker stop "$AGENT_CONTAINER" >/dev/null 2>&1 || true
 
+    find "$OUTPUT_DIR" -name eval_res.json -delete
     start_container "$EVAL_CONTAINER" "$(pwd)/tasks"
     wait_for_container "$EVAL_CONTAINER"
     run_eval_phase

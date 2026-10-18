@@ -1,317 +1,279 @@
-"""
-Evaluation for academic-llm-reasoning-ru-arxiv-word-pptx task.
+"""Deterministic artifact checks against the five papers supplied by preprocess.
 
-Checks:
-1. LLM_Reasoning_Review.docx: headings (RU+EN alt), summary table, required keywords
-2. LLM_Reasoning_Slides.pptx: slide count, title (RU/EN alt), key terms
-3. word_count.txt: exists with two lines containing word counts
-
-Critical checks (any fail -> overall FAIL regardless of accuracy):
-  - all 6 required heading groups found in Word doc
-  - summary table has 5 data rows
-  - all required keywords (chain-of-thought, GSM8K, MATH, RAP, process supervision)
-    present in Word doc
-  - slide count >= 7
+Verify identities, source numerical anchors, requested structure and actual word
+counts. These checks cannot judge arbitrary scientific interpretations or prove
+that the agent read the papers; keyword/fact presence is not a semantic review.
 """
-import os
-import sys
 import json
 import re
+import sys
+import unicodedata
 from argparse import ArgumentParser
 from datetime import datetime
+from pathlib import Path
 
 from docx import Document
 from pptx import Presentation
 
-
 CRITICAL_CHECKS = {
-    "All 6 heading groups found",
-    "Summary table has 5 data rows",
-    "All required keywords present in Word doc",
-    "PPTX has 7+ slides",
+    "Word document readable", "All 6 heading groups found",
+    "Summary table has exactly 5 data rows and 4 columns",
+    "Summary rows match the five source papers",
+    "Word discussion includes source benchmark results",
+    "All required keywords present in Word doc", "Presentation readable",
+    "PPTX has exactly 7 slides", "Required slide content present",
+    "Word counts match extracted artifact text",
 }
-
 FAILED_NAMES = []
 
 
 def _check(name, condition, fail_msg=""):
-    """Print PASS/FAIL line, return (passed, total) increment and track failures."""
     if condition:
         print(f"  PASS: {name}")
         return 1, 1
-    else:
-        print(f"  FAIL: {name}{(': ' + fail_msg) if fail_msg else ''}")
-        FAILED_NAMES.append(name)
-        return 0, 1
+    FAILED_NAMES.append(name)
+    print(f"  FAIL: {name}{(': ' + fail_msg) if fail_msg else ''}")
+    return 0, 1
+
+
+def normalized(text):
+    text = unicodedata.normalize("NFKC", str(text)).casefold().replace("’", "'")
+    return " ".join(re.findall(r"[\w]+", text, flags=re.UNICODE))
+
+
+def mentions(text, phrase):
+    # Technical terms may use spaces, hyphens or typographic dashes.
+    return f" {normalized(phrase)} " in f" {normalized(text)} "
+
+
+RESULT_BENCHMARKS = ("GSM8K", "MATH", "SVAMP", "AQuA", "Game of 24", "Blocksworld",
+                     "Creative Writing", "Mini Crosswords")
+
+
+def benchmark_pattern(name):
+    return r"\b" + r"[\W_]+".join(re.findall(r"\w+", name)) + r"\b"
+
+
+def matching_values(text, value):
+    for match in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)?(?![\w.])", text):
+        number = float(match[0].replace(",", "."))
+        if any(abs(number - target) < 1e-6 for target in (float(value), float(value) / 100)):
+            yield match
+
+
+def has_result(text, fact):
+    """Require a local benchmark/value pair, not two tokens anywhere in a document.
+
+    A benchmark labels subsequent values in its clause until another benchmark.
+    Also accept ordinary reverse notation such as ``56.6% on GSM8K``. Sentence
+    and semicolon boundaries stop a number being borrowed from another result.
+    This verifies numerical anchors; model/baseline attribution and interpretation
+    remain outside this deterministic check.
+    """
+    names = set(RESULT_BENCHMARKS) | {fact["benchmark"]}
+    for clause in re.split(r";|[.!?](?=\s+[A-Za-zА-Яа-я])", str(text)):
+        benchmarks = sorted((m.start(), m.end(), name) for name in names
+                            for m in re.finditer(benchmark_pattern(name), clause, re.IGNORECASE))
+        for value in matching_values(clause, fact["value"]):
+            if any(start <= value.start() < end for start, end, _ in benchmarks):
+                continue  # e.g. the 24 inside the name Game of 24 is not a score.
+            before = [b for b in benchmarks if b[1] <= value.start()]
+            after = [b for b in benchmarks if b[0] >= value.end()]
+            chosen = before[-1] if before else (after[0] if after else None)
+            if after:
+                between = clause[value.end():after[0][0]]
+                reverse_link = re.fullmatch(r"[\s%():,=–—-]*(?:(?:on|на|for)\s*)?", between, re.IGNORECASE)
+                if reverse_link and (not before or after[0][0] - value.end() < value.start() - before[-1][1]):
+                    chosen = after[0]
+            if chosen and normalized(chosen[2]) == normalized(fact["benchmark"]):
+                return True
+    return False
+
+
+def table_has_result(table, fact):
+    """Support both long-form Benchmark/Score rows and benchmark column headers."""
+    rows = [[cell.text for cell in row.cells] for row in table.rows]
+    if any(has_result(" | ".join(row), fact) for row in rows):
+        return True
+    if rows:
+        for index, header in enumerate(rows[0]):
+            if mentions(header, fact["benchmark"]):
+                if any(index < len(row) and has_result(f"{fact['benchmark']}: {row[index]}", fact)
+                       for row in rows[1:]):
+                    return True
+    return False
+
+
+def word_text(doc):
+    texts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            # Merged cells should not count the same XML text several times.
+            seen = set()
+            for cell in row.cells:
+                if cell._tc not in seen:
+                    texts.append(cell.text)
+                    seen.add(cell._tc)
+    return "\n".join(texts)
+
+
+def slide_text(slide):
+    texts = []
+    def visit(shapes):
+        for shape in shapes:
+            if shape.has_text_frame:
+                texts.extend(p.text for p in shape.text_frame.paragraphs)
+            if shape.has_table:
+                texts.extend(cell.text for row in shape.table.rows for cell in row.cells)
+            if hasattr(shape, "shapes"):
+                visit(shape.shapes)
+    visit(slide.shapes)
+    return "\n".join(texts)
 
 
 def check_word_doc(agent_workspace, gt_data):
-    passed = 0
-    total = 0
-    filename = gt_data["review_doc"]["filename"]
-    doc_path = os.path.join(agent_workspace, filename)
-
-    p, t = _check(f"{filename} exists", os.path.exists(doc_path),
-                  f"not found at {doc_path}")
-    passed += p; total += t
-    if not os.path.exists(doc_path):
-        return passed, total
-
-    doc = Document(doc_path)
-
-    all_text = []
-    headings_found = []
-    for para in doc.paragraphs:
-        all_text.append(para.text)
-        if para.style and para.style.name and "Heading" in para.style.name:
-            headings_found.append(para.text.strip())
-
-    full_text = " ".join(all_text).lower()
-
-    # Required headings — each entry is a list of acceptable alternatives.
-    # Any alternative matching as substring (case-insensitive) of a heading
-    # in the doc counts.
-    required_heading_groups = gt_data["review_doc"]["required_headings"]
-    all_groups_found = True
-    for group in required_heading_groups:
-        alts = group if isinstance(group, list) else [group]
-        label = " / ".join(alts)
-        found = any(
-            any(alt.lower() in h.lower() for h in headings_found)
-            for alt in alts
-        )
-        p, t = _check(f"Heading present: {label}", found,
-                      f"none of {alts} found in headings={headings_found}")
-        passed += p; total += t
-        if not found:
-            all_groups_found = False
-
-    p, t = _check("All 6 heading groups found", all_groups_found,
-                  "some heading groups missing (see above)")
-    passed += p; total += t
-
-    # Summary table
-    tables = doc.tables
-    expected_data_rows = gt_data["review_doc"]["required_table_rows"]
-    if len(tables) == 0:
-        p, t = _check(f"Summary table has {expected_data_rows} data rows",
-                      False, "no tables in document")
-        passed += p; total += t
-        p, t = _check("All required table columns present", False,
-                      "no tables to check columns")
-        passed += p; total += t
-    else:
-        table = tables[0]
-        data_rows = sum(
-            1 for row in table.rows[1:]
-            if " ".join(c.text.strip() for c in row.cells).strip()
-        )
-        p, t = _check(f"Summary table has {expected_data_rows} data rows",
-                      data_rows >= expected_data_rows,
-                      f"got {data_rows} data rows")
-        passed += p; total += t
-
-        header_cells = [c.text.strip().lower() for c in table.rows[0].cells]
-        expected_cols = [c.lower() for c in gt_data["review_doc"]["required_table_columns"]]
-        cols_found = sum(
-            1 for ec in expected_cols if any(ec in hc for hc in header_cells)
-        )
-        p, t = _check("All required table columns present",
-                      cols_found >= len(expected_cols),
-                      f"only {cols_found}/{len(expected_cols)} cols, headers={header_cells}")
-        passed += p; total += t
-
-    # Required keywords
-    required_mentions = gt_data["review_doc"]["required_mentions"]
-    all_keywords_found = True
-    for mention in required_mentions:
-        ok = mention.lower() in full_text
-        p, t = _check(f"Keyword in Word doc: {mention}", ok,
-                      f"keyword '{mention}' missing")
-        passed += p; total += t
-        if not ok:
-            all_keywords_found = False
-
-    p, t = _check("All required keywords present in Word doc",
-                  all_keywords_found,
-                  "some keywords missing (see above)")
-    passed += p; total += t
-
-    return passed, total
+    checks = []
+    path = Path(agent_workspace) / gt_data["review_doc"]["filename"]
+    try:
+        doc = Document(path)
+    except Exception as exc:
+        return _check("Word document readable", False, str(exc))
+    checks.append(_check("Word document readable", True))
+    headings = [p.text for p in doc.paragraphs if p.style and "Heading" in p.style.name]
+    groups = gt_data["review_doc"]["required_headings"]
+    heading_ok = all(any(normalized(alt) in normalized(h) for h in headings for alt in
+                         (group if isinstance(group, list) else [group])) for group in groups)
+    checks.append(_check("All 6 heading groups found", heading_ok))
+    required_columns = gt_data["review_doc"]["required_table_columns"]
+    # Other tables are allowed; identify the requested summary by its columns.
+    candidates = [table for table in doc.tables if table.rows and
+                  {normalized(c.text) for c in table.rows[0].cells} ==
+                  {normalized(c) for c in required_columns}]
+    table = candidates[0] if candidates else None
+    shape_ok = table is not None and len(table.rows) == 6 and len(table.columns) == 4
+    checks.append(_check("Summary table has exactly 5 data rows and 4 columns", shape_ok))
+    papers_ok = shape_ok
+    if shape_ok:
+        headers = [normalized(c.text) for c in table.rows[0].cells]
+        rows = [[c.text for c in row.cells] for row in table.rows[1:]]
+        cols = {name: headers.index(normalized(name)) for name in required_columns}
+        matched = set()
+        for row in rows:
+            paper = next((p for p in gt_data["papers_used"]
+                          if normalized(row[cols["Paper Title"]]) == normalized(p["title"])), None)
+            if paper is None or paper["arxiv_id"] in matched:
+                papers_ok = False
+                continue
+            matched.add(paper["arxiv_id"])
+            year_ok = str(row[cols["Year"]]).strip() in {str(y) for y in paper["years"]}
+            method_ok = any(mentions(row[cols["Key Method"]], alias) for alias in paper["method_aliases"])
+            result_ok = any(has_result(row[cols["Main Result"]], fact) for fact in paper["results"])
+            papers_ok = papers_ok and year_ok and method_ok and result_ok
+        papers_ok = papers_ok and len(matched) == 5
+    checks.append(_check("Summary rows match the five source papers", papers_ok))
+    prose = "\n".join(p.text for p in doc.paragraphs)
+    # Numerical discussion must appear in the review, not only in its table.
+    papers = gt_data["papers_used"]
+    facts_ok = all(any(has_result(prose, fact) for fact in paper["results"]) for paper in papers)
+    # The task names these benchmarks, but does not prescribe every primary
+    # score or require the same chosen experiment in prose and summary table.
+    for benchmark in ("GSM8K", "Game of 24", "Blocksworld", "MATH"):
+        facts_ok = facts_ok and any(has_result(prose, fact) for paper in papers
+                                   for fact in paper["results"] if fact["benchmark"] == benchmark)
+    checks.append(_check("Word discussion includes source benchmark results", facts_ok))
+    keyword_ok = all(mentions(word_text(doc), term) for term in gt_data["review_doc"]["required_mentions"])
+    checks.append(_check("All required keywords present in Word doc", keyword_ok))
+    return tuple(map(sum, zip(*checks)))
 
 
 def check_pptx(agent_workspace, gt_data):
-    passed = 0
-    total = 0
-    filename = gt_data["slides"]["filename"]
-    pptx_path = os.path.join(agent_workspace, filename)
+    path = Path(agent_workspace) / gt_data["slides"]["filename"]
+    try:
+        presentation = Presentation(path)
+    except Exception as exc:
+        return _check("Presentation readable", False, str(exc))
+    checks = [_check("Presentation readable", True)]
+    texts = [slide_text(slide) for slide in presentation.slides]
+    checks.append(_check("PPTX has exactly 7 slides", len(texts) == 7))
+    content_ok = len(texts) == 7
+    if content_ok:
+        title_ok = any(mentions(texts[0], t) for t in gt_data["slides"]["required_title_alternatives"])
+        title_ok = title_ok and "2022" in texts[0] and "2023" in texts[0]
+        overview_ok = all(mentions(texts[1], p["title"]) for p in gt_data["papers_used"])
+        cot_ok = all(mentions(texts[2], t) for t in ["chain-of-thought", "self-consistency"])
+        cot_ok = cot_ok and all(any(has_result(texts[2], f) for f in paper["results"])
+                                 for paper in gt_data["papers_used"][:2])
+        tree_ok = mentions(texts[3], "tree of thoughts") and mentions(texts[3], "RAP")
+        tree_ok = tree_ok and all(any(has_result(texts[3], f) for f in paper["results"])
+                                   for paper in gt_data["papers_used"][2:4])
+        process_ok = any(mentions(texts[4], t) for t in ["process supervision", "process-supervised", "PRM"])
+        process_ok = process_ok and any(has_result(texts[4], f) for f in gt_data["papers_used"][4]["results"])
+        tables = [shape.table for shape in presentation.slides[5].shapes if shape.has_table]
+        comparison_facts = {(fact["benchmark"], fact["value"]): fact
+                            for paper in gt_data["papers_used"] for fact in paper["results"]}
+        comparison_ok = any(sum(table_has_result(table, fact)
+                                for fact in comparison_facts.values()) >= 2 for table in tables)
+        conclusion_ok = any(mentions(texts[6], t) for t in ["заключение", "conclusion", "выводы"])
+        content_ok = all([title_ok, overview_ok, cot_ok, tree_ok, process_ok, comparison_ok, conclusion_ok])
+    checks.append(_check("Required slide content present", content_ok))
+    return tuple(map(sum, zip(*checks)))
 
-    p, t = _check(f"{filename} exists", os.path.exists(pptx_path),
-                  f"not found at {pptx_path}")
-    passed += p; total += t
-    if not os.path.exists(pptx_path):
-        return passed, total
 
-    prs = Presentation(pptx_path)
-
-    slide_count = len(prs.slides)
-    required_count = gt_data["slides"]["required_slide_count"]
-    p, t = _check(f"PPTX has {required_count}+ slides",
-                  slide_count >= required_count,
-                  f"got {slide_count} slides")
-    passed += p; total += t
-
-    all_slide_text = []
-    for slide in prs.slides:
-        texts = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    texts.append(para.text)
-            if shape.has_table:
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        texts.append(cell.text)
-        all_slide_text.append(" ".join(texts))
-
-    full_slides_text = " ".join(all_slide_text).lower()
-    first_slide_text = all_slide_text[0].lower() if all_slide_text else ""
-
-    # Title — accept any of the alternatives, partial-match fallback.
-    title_alts = gt_data["slides"].get("required_title_alternatives") or [
-        gt_data["slides"].get("required_title", "")
-    ]
-    title_ok = False
-    matched_alt = None
-    for alt in title_alts:
-        alt_lower = alt.lower()
-        if alt_lower in first_slide_text or alt_lower in full_slides_text:
-            title_ok = True
-            matched_alt = alt
-            break
-        words = alt_lower.split()
-        match_count = sum(1 for w in words if w in full_slides_text)
-        if words and match_count >= len(words) - 1:
-            title_ok = True
-            matched_alt = f"{alt} (partial)"
-            break
-    p, t = _check(f"Title slide matches one of {title_alts}", title_ok,
-                  f"first slide text: {first_slide_text[:100]}")
-    if title_ok:
-        print(f"    matched: {matched_alt}")
-    passed += p; total += t
-
-    for mention in gt_data["slides"]["required_mentions"]:
-        ok = mention.lower() in full_slides_text
-        p, t = _check(f"Keyword in slides: {mention}", ok,
-                      f"keyword '{mention}' missing")
-        passed += p; total += t
-
-    return passed, total
+def count_variants(text):
+    # Common terminal conventions differ on technical hyphens/apostrophes.
+    # Count paragraphs/table cells and slide text; notes, charts and embedded
+    # objects are outside this extraction scope (not a universal Office count).
+    return {len(text.split()), len(re.findall(r"\w+(?:[-'’]\w+)*", text, flags=re.UNICODE)),
+            len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))}
 
 
 def check_word_count(agent_workspace):
-    passed = 0
-    total = 0
-    wc_path = os.path.join(agent_workspace, "word_count.txt")
-
-    p, t = _check("word_count.txt exists", os.path.exists(wc_path),
-                  f"not found at {wc_path}")
-    passed += p; total += t
-    if not os.path.exists(wc_path):
-        return passed, total
-
-    with open(wc_path, "r") as f:
-        content = f.read().strip()
-    lines = [line.strip() for line in content.split("\n") if line.strip()]
-
-    p, t = _check("word_count.txt has >=2 lines", len(lines) >= 2,
-                  f"got {len(lines)} lines")
-    passed += p; total += t
-
-    for line in lines:
-        numbers = re.findall(r'\d+', line)
-        ok = bool(numbers) and any(int(n) > 0 for n in numbers)
-        p, t = _check(f"Line has positive word count: {line[:60]}", ok,
-                      "no positive integer found in line")
-        passed += p; total += t
-
-    p, t = _check("Both filenames referenced",
-                  "LLM_Reasoning_Review" in content
-                  and "LLM_Reasoning_Slides" in content,
-                  "one or both filenames missing")
-    passed += p; total += t
-
-    return passed, total
+    root = Path(agent_workspace)
+    try:
+        lines = [line.strip() for line in (root / "word_count.txt").read_text(encoding="utf-8").splitlines() if line.strip()]
+        counts = {}
+        for line in lines:
+            match = re.fullmatch(r"(LLM_Reasoning_Review\.docx|LLM_Reasoning_Slides\.pptx):\s*(\d+)\s+words", line)
+            if match is None or match[1] in counts:
+                raise ValueError("Expected one actual count per filename")
+            counts[match[1]] = int(match[2])
+        doc = Document(root / "LLM_Reasoning_Review.docx")
+        presentation = Presentation(root / "LLM_Reasoning_Slides.pptx")
+        expected = {
+            "LLM_Reasoning_Review.docx": count_variants(word_text(doc)),
+            "LLM_Reasoning_Slides.pptx": count_variants("\n".join(slide_text(s) for s in presentation.slides)),
+        }
+        ok = set(counts) == set(expected) and all(counts[name] in values for name, values in expected.items())
+        return _check("Word counts match extracted artifact text", ok, f"reported={counts}, actual={expected}")
+    except Exception as exc:
+        return _check("Word counts match extracted artifact text", False, str(exc))
 
 
 def main(args):
-    gt_path = os.path.join(args.groundtruth_workspace, "expected_results.json")
-    if not os.path.exists(gt_path):
-        print(f"FAIL: expected_results.json not found at {gt_path}")
-        sys.exit(1)
-
-    with open(gt_path, "r") as f:
-        gt_data = json.load(f)
-
-    total_passed = 0
-    total_checks = 0
-
-    print("--- Check 1: Word Document (LLM_Reasoning_Review.docx) ---")
-    p, t = check_word_doc(args.agent_workspace, gt_data)
-    print(f"  Word Doc: {p}/{t} checks passed")
-    total_passed += p; total_checks += t
-
-    print("\n--- Check 2: PowerPoint (LLM_Reasoning_Slides.pptx) ---")
-    p, t = check_pptx(args.agent_workspace, gt_data)
-    print(f"  PowerPoint: {p}/{t} checks passed")
-    total_passed += p; total_checks += t
-
-    print("\n--- Check 3: Word Count File (word_count.txt) ---")
-    p, t = check_word_count(args.agent_workspace)
-    print(f"  Word Count: {p}/{t} checks passed")
-    total_passed += p; total_checks += t
-
-    if total_checks == 0:
-        print("\nFAIL: No checks were performed.")
-        accuracy = 0.0
-    else:
-        accuracy = total_passed / total_checks * 100
-        print(f"\nOverall: {total_passed}/{total_checks} checks passed ({accuracy:.1f}%)")
-
-    critical_failed = [n for n in FAILED_NAMES if n in CRITICAL_CHECKS]
-    if critical_failed:
-        print(f"CRITICAL FAILURES: {len(critical_failed)}")
-        for n in critical_failed:
-            print(f"  - {n}")
-
-    result = {
-        "total_passed": total_passed,
-        "total_checks": total_checks,
-        "accuracy": accuracy,
-        "critical_failed": critical_failed,
-        "timestamp": datetime.now().isoformat(),
-    }
+    FAILED_NAMES.clear()
+    # Preserve the shared required-artifact preflight before content checks.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
+    with open(Path(args.groundtruth_workspace) / "expected_results.json", encoding="utf-8") as file:
+        gt_data = json.load(file)
+    results = [check_word_doc(args.agent_workspace, gt_data), check_pptx(args.agent_workspace, gt_data),
+               check_word_count(args.agent_workspace)]
+    passed, total = map(sum, zip(*results))
+    critical = [name for name in FAILED_NAMES if name in CRITICAL_CHECKS]
+    result = {"total_passed": passed, "total_checks": total, "accuracy": 100 * passed / total if total else 0,
+              "critical_failed": critical, "timestamp": datetime.now().isoformat()}
     if args.res_log_file:
-        with open(args.res_log_file, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"Report saved to {args.res_log_file}")
-
-    if critical_failed:
-        print("FAIL (critical check failed)")
-        sys.exit(1)
-    if accuracy >= 80:
-        print("PASS")
-        sys.exit(0)
-    print("FAIL")
-    sys.exit(1)
+        Path(args.res_log_file).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    success = not critical and result["accuracy"] >= 80
+    print("PASS" if success else "FAIL")
+    raise SystemExit(0 if success else 1)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--agent_workspace", required=False, default=".")
-    parser.add_argument("--groundtruth_workspace", required=False, default=".")
-    parser.add_argument("--launch_time", required=False)
-    parser.add_argument("--res_log_file", required=False)
-    args = parser.parse_args()
-    main(args)
+    parser.add_argument("--agent_workspace", default=".")
+    parser.add_argument("--groundtruth_workspace", default=".")
+    parser.add_argument("--launch_time")
+    parser.add_argument("--res_log_file")
+    main(parser.parse_args())

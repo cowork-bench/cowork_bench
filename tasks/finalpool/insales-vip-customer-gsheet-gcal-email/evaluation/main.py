@@ -203,6 +203,12 @@ def main():
     parser.add_argument("--res_log_file", required=False)
     args = parser.parse_args()
 
+    # Validate mandatory artifacts before dependent checks can return early.
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    from utils.evaluation.artifact_guards import require_task_artifacts
+    require_task_artifacts(__file__, args.agent_workspace)
+
     print("=" * 70)
     print("WC VIP CUSTOMER GSHEET GCAL EMAIL - EVALUATION")
     print("=" * 70)

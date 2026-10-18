@@ -9,16 +9,24 @@ Strict evaluation for rzd-hr1c-training-trip-kazan-strict-excel-email-gcal.
     - персональное письмо адресовано одному из участников
     - GCal: ровно одно утреннее и одно вечернее событие 17.03
 
-PASS если ≥ 80%.
+PASS если ≥ 80% и все обязательные проверки целостности пройдены.
 """
-import glob
 import json
 import os
 import sys
+from collections import Counter
+from datetime import datetime, time
+import re
+from email.utils import getaddresses
+from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
 
 import psycopg2
 import openpyxl
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.evaluation.spreadsheets import load_calculated_workbook, UnsupportedExternalWorkbook
 
 DB_CONFIG = {
     "host": os.environ.get("PGHOST", "localhost"),
@@ -30,15 +38,18 @@ DB_CONFIG = {
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
+CRITICAL_FAILED = []
 
 
-def record(name, passed, detail=""):
+def record(name, passed, detail="", critical=False):
     global PASS_COUNT, FAIL_COUNT
     if passed:
         PASS_COUNT += 1
         print(f"  [PASS] {name}")
     else:
         FAIL_COUNT += 1
+        if critical:
+            CRITICAL_FAILED.append(name)
         msg = f": {str(detail)[:300]}" if detail else ""
         print(f"  [FAIL] {name}{msg}")
 
@@ -73,49 +84,48 @@ def header_index(ws, *candidates):
 # ─── DB helpers ──────────────────────────────────────────────────────────────
 
 def fetch_eligible_employees():
-    """Сотрудники, удовлетворяющие критерию (Продажи/Маркетинг + опыт ≥ 3)."""
+    """The five required participants, ranked exactly as specified in task.md."""
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("""
-        SELECT "EMPLOYEE_NAME", "DEPARTMENT", "YEARS_EXPERIENCE", "EMAIL"
+        SELECT "EMPLOYEE_ID", "EMPLOYEE_NAME", "DEPARTMENT", "YEARS_EXPERIENCE", "SALARY", "EMAIL"
         FROM hr1c_data."HR__PUBLIC__EMPLOYEES"
         WHERE "DEPARTMENT" IN ('Продажи', 'Маркетинг')
           AND "YEARS_EXPERIENCE" >= 3
+        ORDER BY "YEARS_EXPERIENCE" DESC, "EMPLOYEE_ID" ASC
+        LIMIT 5
     """)
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return rows  # list of (name, dept, years, email)
+    return rows  # list of (id, name, dept, years, salary, email)
 
 
 # ─── Excel checks ────────────────────────────────────────────────────────────
 
 def check_excel(agent_workspace):
     print("\n=== Check 1: Excel-отчёт ===")
-    xlsx_files = glob.glob(os.path.join(agent_workspace, "*.xlsx"))
-    train_files = [f for f in xlsx_files if any(
-        kw in os.path.basename(f).lower()
-        for kw in ["training", "travel", "report", "trip", "kazan"]
-    )]
-    if not train_files:
-        record("xlsx-отчёт существует", False, f"нет подходящих xlsx: {xlsx_files}")
+    xlsx_path = os.path.join(agent_workspace, "Training_Travel_Report.xlsx")
+    if not os.path.isfile(xlsx_path):
+        record("xlsx-отчёт существует", False, f"не найден: {xlsx_path}", critical=True)
         return
     record("xlsx-отчёт существует", True)
 
-    xlsx_path = train_files[0]
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb = load_calculated_workbook(xlsx_path)
+    except (ImportError, RuntimeError, UnsupportedExternalWorkbook):
+        raise
     except Exception as e:
-        record("Excel-файл читается", False, str(e))
+        record("Excel-файл читается", False, str(e), critical=True)
         return
     record("Excel-файл читается", True)
 
     eligible = fetch_eligible_employees()
-    eligible_names = {r[0] for r in eligible}
+    eligible_names = {r[1] for r in eligible}
 
     # ── Employees ────────────────────────────────────────────────────────
     ws = find_sheet(wb, "employ", "staff", "сотрудник")
     if ws is None:
-        record("лист Employees найден", False, f"листы: {wb.sheetnames}")
+        record("лист Employees найден", False, f"листы: {wb.sheetnames}", critical=True)
     else:
         record("лист Employees найден", True)
         rows = data_rows(ws)
@@ -124,6 +134,35 @@ def check_excel(agent_workspace):
         name_col = header_index(ws, "name", "фио", "имя")
         dept_col = header_index(ws, "department", "отдел")
         eligible_col = header_index(ws, "eligible", "допущен")
+
+        required = ("Employee_ID", "Name", "Department", "Years_Experience", "Salary", "Email")
+        header = [str(value).strip().casefold() for value in next(ws.iter_rows(values_only=True), ())]
+        indexes = [header.index(name.casefold()) if name.casefold() in header else None
+                   for name in required]
+        expected = {str(emp[0]): emp for emp in eligible}
+        seen = []
+        correct = len(rows) == 5 and len(expected) == 5 and None not in indexes
+        if correct:
+            for row in rows:
+                values = tuple(row[index] for index in indexes)
+                employee_id = str(values[0])
+                seen.append(employee_id)
+                reference = expected.get(employee_id)
+                if reference is None:
+                    correct = False
+                    continue
+                for index, (actual, wanted) in enumerate(zip(values, reference)):
+                    if index in (3, 4):
+                        try:
+                            equal = float(actual) == float(wanted)
+                        except (TypeError, ValueError):
+                            equal = False
+                    else:
+                        equal = str(actual).strip() == str(wanted).strip()
+                    correct = correct and equal
+        record("Employees содержит требуемую пятёрку и её данные из HR",
+               correct and len(set(seen)) == 5 and set(seen) == set(expected),
+               f"employee_ids={seen}, expected_ids={list(expected)}", critical=True)
 
         all_text = " ".join(str(c) for r in rows for c in r if c is not None)
         valid_names = 0
@@ -156,7 +195,7 @@ def check_excel(agent_workspace):
     # ── Travel_Plan ──────────────────────────────────────────────────────
     ws = find_sheet(wb, "travel", "plan", "trip", "поездк")
     if ws is None:
-        record("лист Travel_Plan найден", False, f"листы: {wb.sheetnames}")
+        record("лист Travel_Plan найден", False, f"листы: {wb.sheetnames}", critical=True)
     else:
         record("лист Travel_Plan найден", True)
         rows = data_rows(ws)
@@ -182,6 +221,19 @@ def check_excel(agent_workspace):
         record("5 строк с направлением «Туда»", len(outbound) == 5, f"найдено: {len(outbound)}")
         record("5 строк с направлением «Обратно»", len(ret) == 5, f"найдено: {len(ret)}")
 
+        employee_col = header_index(ws, "employee_name", "фио", "сотрудник")
+        def employee_counts(journeys):
+            if employee_col is None:
+                return Counter()
+            return Counter(str(row[employee_col]).strip() for row in journeys)
+        expected_counts = Counter(emp[1] for emp in eligible)
+        record("Travel_Plan: каждому выбранному участнику ровно одна поездка туда и обратно",
+               len(expected_counts) == 5
+               and employee_counts(outbound) == expected_counts
+               and employee_counts(ret) == expected_counts,
+               f"outbound={dict(employee_counts(outbound))}, return={dict(employee_counts(ret))}",
+               critical=True)
+
         outbound_trains = {row_train(r) for r in outbound}
         return_trains = {row_train(r) for r in ret}
         out_ok = outbound_trains and all(
@@ -200,10 +252,41 @@ def check_excel(agent_workspace):
                len(prices) == 10 and all(p == 4500 for p in prices),
                f"цены: {prices}")
 
+        # Validate the report itself; correct calendar windows cannot compensate
+        # for fabricated departure/arrival, class or fare in Travel_Plan.
+        required = ("Train_No", "Departure_Time", "Arrival_Time", "Seat_Class", "Ticket_Price_RUB")
+        header = [str(value).strip().casefold() for value in next(ws.iter_rows(values_only=True), ())]
+        columns = [header.index(name.casefold()) if name.casefold() in header else None
+                   for name in required]
+        def clock(value):
+            if isinstance(value, (datetime, time)):
+                return value.strftime("%H:%M") if value.second == value.microsecond == 0 else None
+            match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::00)?", str(value).strip())
+            return f"{int(match[1]):02d}:{match[2]}" if match else None
+        def matches(journeys, train, depart, arrive):
+            if None in columns or len(journeys) != 5:
+                return False
+            for row in journeys:
+                values = [row[index] for index in columns]
+                number = str(values[0]).strip().upper().translate(str.maketrans({"G": "Г", "A": "А"}))
+                try:
+                    fare_ok = abs(float(values[4]) - 4500) <= 0.01
+                except (TypeError, ValueError):
+                    fare_ok = False
+                if (number != train or clock(values[1]) != depart or clock(values[2]) != arrive
+                        or str(values[3]).strip().casefold() not in {"эконом", "economy", "economy class"}
+                        or not fare_ok):
+                    return False
+            return True
+        record("Travel_Plan: реальные поезда, время, Эконом и тариф 4500 ₽",
+               matches(outbound, "716Г", "06:25", "11:50")
+               and matches(ret, "717Г", "18:30", "23:55"),
+               "Expected the seeded 716Г/717Г schedules and Economy fare", critical=True)
+
     # ── Budget_Summary ───────────────────────────────────────────────────
     ws = find_sheet(wb, "budget", "summar", "бюджет")
     if ws is None:
-        record("лист Budget_Summary найден", False, f"листы: {wb.sheetnames}")
+        record("лист Budget_Summary найден", False, f"листы: {wb.sheetnames}", critical=True)
     else:
         record("лист Budget_Summary найден", True)
         rows = data_rows(ws)
@@ -219,6 +302,32 @@ def check_excel(agent_workspace):
         record("в Budget_Summary есть итог ровно 45 000 ₽",
                has_45000, f"числовые значения: {sorted(all_vals)}")
 
+        header = {str(value).strip().casefold(): index
+                  for index, value in enumerate(next(ws.iter_rows(values_only=True), ()))}
+        required = ("Item", "Count", "Unit_Price_RUB", "Total_RUB")
+        associated = len(rows) == 3 and all(name.casefold() in header for name in required)
+        budget = {}
+        if associated:
+            for row in rows:
+                label = str(row[header["item"]]).strip().casefold()
+                kind = ("outbound" if "туда" in label else "return" if "обрат" in label
+                        else "total" if "итого" in label or label == "total" else None)
+                if kind is None or kind in budget:
+                    associated = False
+                    continue
+                budget[kind] = row
+            for kind, row in budget.items():
+                expected = {"Total_RUB": 45000} if kind == "total" else {
+                    "Count": 5, "Unit_Price_RUB": 4500, "Total_RUB": 22500}
+                for column, expected_value in expected.items():
+                    try:
+                        associated = associated and abs(float(row[header[column.casefold()]]) - expected_value) <= 0.01
+                    except (TypeError, ValueError):
+                        associated = False
+        record("Budget_Summary: две группы по 5 × 4500 ₽ и связанный итог 45000 ₽",
+               associated and set(budget) == {"outbound", "return", "total"},
+               f"Budget groups: {list(budget)}", critical=True)
+
 
 # ─── Calendar ────────────────────────────────────────────────────────────────
 
@@ -228,26 +337,37 @@ def check_gcal():
     cur = conn.cursor()
     cur.execute("""
         SELECT summary, start_datetime, end_datetime FROM gcal.events
-        WHERE start_datetime >= '2026-03-17'
-          AND start_datetime < '2026-03-18'
+        WHERE start_datetime >= '2026-03-17 00:00:00+03:00'
+          AND start_datetime < '2026-03-18 00:00:00+03:00'
           AND summary NOT ILIKE '%кикофф%'
         ORDER BY start_datetime
     """)
     events = cur.fetchall()
     cur.close(); conn.close()
 
+    expected = {
+        "Корпоративный тренинг — выезд в Казань": ("05:55", "11:50"),
+        "Корпоративный тренинг — возврат в Москву": ("18:30", "23:55"),
+    }
+    def local_time(value):
+        if not isinstance(value, datetime):
+            return None
+        # PostgreSQL timestamptz values are aware; legacy timestamp fixtures
+        # represent local Moscow/Kazan time.
+        if value.tzinfo is not None:
+            value = value.astimezone(ZoneInfo("Europe/Moscow"))
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+
     record("ровно 2 события поездки на 17.03.2026", len(events) == 2,
-           f"найдено {len(events)}: {[e[0] for e in events]}")
-    if len(events) >= 1:
-        e1 = events[0]
-        morning = e1[1].hour < 7
-        record("первое событие — утреннее (выезд, начало до 07:00)",
-               morning, f"start: {e1[1]}")
-    if len(events) >= 2:
-        e2 = events[1]
-        evening = e2[1].hour >= 18
-        record("второе событие — вечернее (возврат, начало с 18:00)",
-               evening, f"start: {e2[1]}")
+           f"найдено {len(events)}: {[e[0] for e in events]}", critical=True)
+    for title, (start, end) in expected.items():
+        matching = [(begin, finish) for name, begin, finish in events
+                    if " ".join(str(name).split()) == title]
+        correct = (len(matching) == 1
+                   and local_time(matching[0][0]) == f"2026-03-17 {start}:00"
+                   and local_time(matching[0][1]) == f"2026-03-17 {end}:00")
+        record(f"Календарь: {title}, {start}–{end}", correct,
+               f"найдено: {matching}", critical=True)
 
 
 # ─── Emails ──────────────────────────────────────────────────────────────────
@@ -303,7 +423,7 @@ def check_emails():
     record("в письме HR упомянута дата (17.03.2026 / 17 марта)", has_date,
            f"snippet: {combined[:300]}")
 
-    eligible_emails = {r[3] for r in fetch_eligible_employees() if r[3]}
+    eligible_emails = {str(r[5]).casefold() for r in fetch_eligible_employees() if r[5]}
     employee_msgs = []
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -329,12 +449,18 @@ def check_emails():
     except Exception:
         pass
 
-    addressed = any(
-        any(e in to_text for e in eligible_emails) for to_text in employee_msgs
-    )
-    record("персональное письмо отправлено на email одного из кандидатов",
+    def recipients(value):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = value
+        values = parsed if isinstance(parsed, list) else [parsed]
+        return {address.casefold() for _, address in getaddresses([str(v) for v in values])}
+
+    addressed = any(recipients(to_text) & eligible_emails for to_text in employee_msgs)
+    record("персональное письмо отправлено на email одного из пяти участников",
            addressed,
-           f"emails to: {employee_msgs[:5]}")
+           f"emails to: {employee_msgs[:5]}", critical=True)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -355,12 +481,13 @@ def main():
     accuracy = PASS_COUNT / total * 100 if total > 0 else 0
     print(f"\nИтого: {PASS_COUNT}/{total} проверок пройдено ({accuracy:.1f}%)")
 
-    result = {"total_passed": PASS_COUNT, "total_checks": total, "accuracy": accuracy}
+    result = {"total_passed": PASS_COUNT, "total_checks": total, "accuracy": accuracy,
+              "critical_failed": CRITICAL_FAILED}
     if args.res_log_file:
         with open(args.res_log_file, "w") as f:
             json.dump(result, f, indent=2)
 
-    if accuracy >= 80:
+    if accuracy >= 80 and not CRITICAL_FAILED:
         print("PASS")
         sys.exit(0)
     else:
