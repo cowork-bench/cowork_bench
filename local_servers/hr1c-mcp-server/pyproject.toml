@@ -3,7 +3,7 @@ name = "hr1c_mcp_server"
 version = "0.1.0"
 description = "1С:ЗУП-подобный HR MCP-сервер (российская HR-БД поверх PostgreSQL)"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp>=1.0.0",
     "pandas>=2.2.3",
@@ -20,6 +20,55 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+# Pin to the package versions of the previous prod image
+# (harbor-main:native-mcp-f784db8-20260818); see smoke r11 2026-10-22.
+constraint-dependencies = [
+    "annotated-types==0.8.0",
+    "anyio==4.14.2",
+    "attrs==26.1.0",
+    "cffi==2.1.1",
+    "click==8.4.2",
+    "cryptography==50.0.0",
+    "h11==0.16.0",
+    "httpcore2==2.10.0",
+    "httpx2==2.10.0",
+    "idna==3.18",
+    "iniconfig==2.3.0",
+    "jsonschema==4.26.0",
+    "mcp==1.26.0",
+    "nodeenv==1.10.0",
+    "numpy==2.5.2",
+    "opentelemetry-api==1.44.0",
+    "packaging==26.3",
+    "pandas==3.0.5",
+    "pluggy==1.6.0",
+    "psycopg2-binary==2.9.12",
+    "pycparser==3.0",
+    "pydantic-core==2.46.4",
+    "pydantic==2.13.4",
+    "pygments==2.20.0",
+    "pyjwt==2.13.0",
+    "pyright==1.1.411",
+    "pytest-asyncio==1.4.0",
+    "pytest==9.1.1",
+    "python-dateutil==2.9.0.post0",
+    "python-dotenv==1.2.2",
+    "python-multipart==0.0.32",
+    "pyyaml==6.0.3",
+    "referencing==0.37.0",
+    "rpds-py==2026.6.3",
+    "setuptools==84.0.0",
+    "six==1.17.0",
+    "sqlparse==0.5.5",
+    "sse-starlette==3.4.8",
+    "starlette==1.6.0",
+    "tomli==2.4.1",
+    "truststore==0.10.4",
+    "typing-extensions==4.16.0",
+    "typing-inspection==0.4.3",
+    "uvicorn==0.52.1",
+]
+
 dev-dependencies = ["pyright>=1.1.389"]
 
 [project.scripts]

@@ -9,7 +9,8 @@ RUN /opt/local_servers/playwright-mcp/node_modules/.bin/playwright install chrom
 
 # LiteLLM 1.92 imports its proxy MCP chat handler for tool-enabled requests but
 # the base install omits that handler's runtime dependencies.
-RUN uv pip install --python /opt/venv/bin/python 'litellm[proxy]==1.92.0'
+RUN uv pip install --python /opt/venv/bin/python \
+    -c /tmp/constraints-opt-venv.txt 'litellm[proxy]==1.92.0'
 
 # CLI agents are preinstalled because evaluation containers cannot rely on
 # GitHub/nvm/package downloads during agent setup. Node 22 is already provided
@@ -54,12 +55,19 @@ COPY configs/mcp_servers/playwright_with_chunk.yaml \
 COPY configs/mcp_servers/pptx.yaml \
     /workspace/configs/mcp_servers/pptx.yaml
 
-# Harbor uploads verifier code only after the agent phase. Keep the runtime
-# task tree free of answer keys so the Cowork agent cannot inspect them.
-RUN find /workspace/tasks/finalpool -type d \
-      \( -name evaluation -o -name groundtruth_workspace -o -name groundtruth_workspace_cn \) \
-      -prune -exec rm -rf {} + \
-    && rm -rf /workspace/dumps \
+# Harbor uploads verifier code only after the agent phase, and the agent's
+# data plane is the per-task payload (environment/task_payload) plus the
+# cowork_shared volume — nothing reads the repo-baked tasks tree at runtime.
+# The base image (cowork-pack) bakes the whole repository via COPY . ., so
+# remove what the agent must not see: all tasks (its own — the verifier
+# re-creates $ROOT from the /tests mount after the agent stops; others —
+# instructions would leak expected values for cross-checking), the solution
+# Oracle, and the adapter tooling itself (generator/validator/tests reveal
+# where answers live and how they are stripped). Everything the runtime
+# needs stays: scripts/ + utils/ (grader phase), strands_runner/ + configs/
+# (model controls, MCP stdio), main*.py (CLI agents).
+RUN rm -rf /workspace/tasks /workspace/solution /workspace/harbor_adapter \
+           /workspace/dumps \
     && mkdir -p /workspace/dumps /logs/agent /logs/verifier /logs/artifacts
 
 # Fail the build if the pinned vendored Playwright revision changes without a

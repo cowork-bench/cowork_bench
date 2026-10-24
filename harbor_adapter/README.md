@@ -30,10 +30,21 @@ commit them.
 
 ## Credentials
 
-Generated tasks ship a zero-byte `environment/pg.env`, so the packaged dataset
-contains no secrets. A DB task will not start until it is populated —
-`postgres` exits with code 1 because its healthcheck runs
-`pg_isready -U $POSTGRES_USER` with the variable unset.
+Generated tasks ship a populated `environment/pg.env` — one credential set per
+dataset (user/db default to `eigent`/`cowork_gym`; the password is taken from
+`--pg-password`, reused from a populated pg.env already in the output tree, or
+generated). Postgres seeds its user from it; `workspace-prep`,
+`mcp-gateway-db` and `grader` connect with it.
+
+The agent container stays blind to it: the `main` service has no env_file or
+volume reference to pg.env, no PG credentials in env, no mount of the package
+root or `environment/`, no docker socket, and no shared network with
+`postgres`; the password value never appears in agent-visible files
+(`task.toml`, `instruction.md`, `mcp_manifest_public.json`, prep script,
+task payload). `validate_harbor_canonical.py` enforces all of the above.
+
+`environment/pg.env.example` and `generate_pg_env.sh` document the 13-key
+layout for manual re-creation:
 
 ```bash
 POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=... \

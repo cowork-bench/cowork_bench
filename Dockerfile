@@ -29,7 +29,10 @@ WORKDIR /workspace
 
 # Create venv OUTSIDE /workspace so it is not shadowed by the volume mount
 # camel-ai brings: openai, pyyaml, httpx, tiktoken, etc.
+# The constraints file pins every package to the working versions
+COPY constraints-opt-venv.txt /tmp/constraints-opt-venv.txt
 RUN uv venv /opt/venv && uv pip install --python /opt/venv/bin/python \
+    -c /tmp/constraints-opt-venv.txt \
     "camel-ai" \
     "anthropic" \
     "psycopg2-binary" \

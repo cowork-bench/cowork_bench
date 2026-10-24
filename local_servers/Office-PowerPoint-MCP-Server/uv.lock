@@ -1,6 +1,52 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
+
+[manifest]
+constraints = [
+    { name = "annotated-doc", specifier = "==0.0.4" },
+    { name = "annotated-types", specifier = "==0.7.0" },
+    { name = "anyio", specifier = "==4.12.1" },
+    { name = "attrs", specifier = "==25.4.0" },
+    { name = "certifi", specifier = "==2026.2.25" },
+    { name = "cffi", specifier = "==2.0.0" },
+    { name = "click", specifier = "==8.3.1" },
+    { name = "cryptography", specifier = "==46.0.5" },
+    { name = "exceptiongroup", specifier = "==1.3.1" },
+    { name = "fonttools", specifier = "==4.61.1" },
+    { name = "h11", specifier = "==0.16.0" },
+    { name = "httpcore", specifier = "==1.0.9" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "httpx-sse", specifier = "==0.4.3" },
+    { name = "idna", specifier = "==3.11" },
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "jsonschema-specifications", specifier = "==2025.9.1" },
+    { name = "lxml", specifier = "==6.0.2" },
+    { name = "markdown-it-py", specifier = "==4.0.0" },
+    { name = "mcp", specifier = "==1.26.0" },
+    { name = "mdurl", specifier = "==0.1.2" },
+    { name = "pillow", specifier = "==12.1.1" },
+    { name = "pycparser", specifier = "==3.0" },
+    { name = "pydantic", specifier = "==2.12.5" },
+    { name = "pydantic-core", specifier = "==2.41.5" },
+    { name = "pydantic-settings", specifier = "==2.13.1" },
+    { name = "pygments", specifier = "==2.19.2" },
+    { name = "pyjwt", specifier = "==2.11.0" },
+    { name = "python-dotenv", specifier = "==1.2.2" },
+    { name = "python-multipart", specifier = "==0.0.22" },
+    { name = "python-pptx", specifier = "==1.0.2" },
+    { name = "referencing", specifier = "==0.37.0" },
+    { name = "rich", specifier = "==14.3.3" },
+    { name = "rpds-py", specifier = "==0.30.0" },
+    { name = "shellingham", specifier = "==1.5.4" },
+    { name = "sse-starlette", specifier = "==3.3.2" },
+    { name = "starlette", specifier = "==0.52.1" },
+    { name = "typer", specifier = "==0.24.1" },
+    { name = "typing-extensions", specifier = "==4.15.0" },
+    { name = "typing-inspection", specifier = "==0.4.2" },
+    { name = "uvicorn", specifier = "==0.41.0" },
+    { name = "xlsxwriter", specifier = "==3.2.9" },
+]
 
 [[package]]
 name = "annotated-doc"
@@ -220,7 +266,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [

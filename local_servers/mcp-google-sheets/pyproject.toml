@@ -31,3 +31,41 @@ fallback-version = "0.0.0"
 
 [project.scripts]
 mcp-google-sheets = "mcp_google_sheets:main"
+
+[tool.uv]
+# Pin to the package versions of the previous prod image
+# (harbor-main:native-mcp-f784db8-20260818). The rebuild of
+# 2026-10-19 re-resolved unpinned deps: mcp 2.3.0 removed
+# lowlevel Server.list_resources() (clickhouse/hr1c crash), and
+# failed resolution left the Word / arxiv-latex venvs empty.
+constraint-dependencies = [
+    "annotated-types==0.7.0",
+    "anyio==4.12.1",
+    "attrs==25.4.0",
+    "certifi==2026.2.25",
+    "cffi==2.0.0",
+    "click==8.3.1",
+    "cryptography==46.0.5",
+    "h11==0.16.0",
+    "httpcore==1.0.9",
+    "httpx-sse==0.4.3",
+    "httpx==0.28.1",
+    "idna==3.11",
+    "jsonschema==4.26.0",
+    "mcp==1.26.0",
+    "psycopg2-binary==2.9.11",
+    "pycparser==3.0",
+    "pydantic-core==2.41.5",
+    "pydantic-settings==2.13.1",
+    "pydantic==2.12.5",
+    "pyjwt==2.11.0",
+    "python-dotenv==1.2.2",
+    "python-multipart==0.0.22",
+    "referencing==0.37.0",
+    "rpds-py==0.30.0",
+    "sse-starlette==3.3.2",
+    "starlette==0.52.1",
+    "typing-extensions==4.15.0",
+    "typing-inspection==0.4.2",
+    "uvicorn==0.41.0",
+]

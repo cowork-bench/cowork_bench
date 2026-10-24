@@ -8,7 +8,8 @@ Minimal delta vs harbor-native rc packaging:
   - agent-agnostic instruction (docs/task.md core only)
   - task.toml lists only mcp-gateway-public streamable-http URLs
   - dual gateway compose; no PG* on main
-  - workspace_lifecycle under tests/verifier only
+  - main finalize hook mounts only lifecycle modules at /opt/cowork_lifecycle
+  - evaluation/groundtruth stay under tests/ and are not mounted on main
   - solution/solve.sh Oracle for tasks with groundtruth_workspace
   - no Strands / ask_user / per-MCP HTTP rewrite
 """
@@ -18,8 +19,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
+import tarfile
 import textwrap
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,8 +39,8 @@ from native_mcp.catalog import (  # noqa: E402
     servers_for_task,
     split_servers,
 )
+from grader_verdict_contract import analyze_source, apply_plan, is_applied  # noqa: E402
 from native_mcp.prep.db_rewrite import rewrite_preprocess_db_connections  # noqa: E402
-
 NATIVE_DIR = Path(__file__).resolve().parent / "native_mcp"
 PREP_SRC = NATIVE_DIR / "prep" / "prepare_workspace.py"
 
@@ -98,8 +101,83 @@ WORKSPACE_HINT = (
 )
 
 
-def _has_mock_http(source: Path) -> bool:
-    return (source / "files" / "mock_pages.tar.gz").is_file()
+
+def _instruction_localhost_port(instruction: str) -> int | None:
+    """Return the localhost port named by the agent instruction."""
+    match = re.search(r"localhost:(\d{2,5})", instruction)
+    return int(match.group(1)) if match else None
+
+
+def _preprocess_http_port(preprocess: str) -> int | None:
+    """Return the task HTTP port from preprocess, excluding PostgreSQL."""
+    for match in re.finditer(
+        r"(?im)^\s*(?:(?:MOCK_)?PORT|port)\s*=\s*(\d{2,5})\b",
+        preprocess,
+    ):
+        port = int(match.group(1))
+        if port != 5432:
+            return port
+    return None
+
+
+def _tar_top_directory(archive: Path) -> str:
+    """Return the real top-level payload directory, ignoring macOS metadata."""
+    with tarfile.open(archive, "r:gz") as handle:
+        roots = []
+        for member in handle.getmembers():
+            name = member.name
+            while name.startswith("./"):
+                name = name[2:]
+            if not name:
+                continue
+            root = name.split("/", 1)[0]
+            if root == "__MACOSX" or root.startswith("._"):
+                continue
+            if root not in roots:
+                roots.append(root)
+    if len(roots) != 1:
+        raise ValueError(f"{archive}: expected one payload root, got {roots}")
+    return roots[0]
+
+
+def _mock_http_spec(source: Path, instruction: str) -> dict | None:
+    """Derive the local HTTP fixture from task sources instead of a task list."""
+    preprocess_path = source / "preprocess" / "main.py"
+    if not preprocess_path.is_file():
+        return None
+    preprocess = preprocess_path.read_text(encoding="utf-8", errors="ignore")
+    if "http.server" not in preprocess and "HTTPServer" not in preprocess:
+        return None
+
+    port = _instruction_localhost_port(instruction) or _preprocess_http_port(preprocess)
+    if port is None:
+        raise ValueError(f"{source.name}: HTTP preprocess has no discoverable port")
+
+    candidates = (
+        Path("files/mock_pages.tar.gz"),
+        Path("files/mock_dashboard.tar.gz"),
+        Path("files/mock_pages"),
+        Path("tmp/mock_pages"),
+    )
+    asset = next((rel for rel in candidates if (source / rel).exists()), None)
+    if asset is None:
+        raise ValueError(f"{source.name}: HTTP preprocess has no fixture payload")
+
+    container_asset = f"/mock/{asset.name}"
+    spec = {
+        "port": port,
+        "volume": f"./task_payload/{asset.as_posix()}:{container_asset}:ro",
+        "extract": "",
+        "directory": container_asset,
+    }
+    if asset.name.endswith(".tar.gz"):
+        root = _tar_top_directory(source / asset)
+        spec["extract"] = (
+            "        mkdir -p /tmp/mock\n"
+            f"        tar -xzf {container_asset} -C /tmp/mock\n"
+        )
+        spec["directory"] = f"/tmp/mock/{root}"
+    return spec
 
 
 def _usable_groundtruth(source: Path) -> bool:
@@ -143,6 +221,65 @@ def _rewrite_evaluation_db_secrets(evaluation_dir: Path) -> None:
             updated = "import os\n" + updated
         if updated != original:
             py.write_text(updated, encoding="utf-8")
+
+
+_SHIM_RE = re.compile(r"sys\.path\.insert\(\s*0\s*,[^)]*__file__")
+
+
+def _first_flat_sibling_import(main_py: Path) -> int | None:
+    """Lineno of the first module-level flat import of a sibling module.
+
+    Relative (dotted) imports are fine under the canonical ``-m`` invocation
+    and are skipped. Returns None when the grader already carries the
+    authors' sys.path shim or imports no sibling flat.
+    """
+    siblings = {p.stem for p in main_py.parent.glob("*.py")}
+    siblings -= {main_py.stem, "__init__"}
+    if not siblings:
+        return None
+    source = main_py.read_text(encoding="utf-8", errors="replace")
+    if _SHIM_RE.search(source):
+        return None
+    import ast  # noqa: PLC0415 — нужен только при наличии сиблингов
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                continue
+            names = [node.module.split(".")[0]] if node.module else []
+        else:
+            continue
+        if any(name in siblings for name in names):
+            return node.lineno
+    return None
+
+
+def _ensure_sibling_import_shim(main_py: Path) -> bool:
+    """Make flat sibling imports resolvable under ``python -m`` and as a script.
+
+    Grading runs ``python -m tasks.finalpool.<task>.evaluation.main`` from
+    /workspace, so the grader's own directory is never on sys.path; the
+    oracle branch runs the same file as a plain script. Upstream carried two
+    author idioms — relative imports (only -m) and flat imports with a
+    sys.path shim (both modes). The harbor port flattened two relative
+    graders without the shim, so ``from check_local import ...`` broke the
+    -m path. Insert the authors' shim into the packaged copy only.
+    """
+    lineno = _first_flat_sibling_import(main_py)
+    if lineno is None:
+        return False
+    lines = main_py.read_text(encoding="utf-8").splitlines(keepends=True)
+    first = lines[lineno - 1]
+    pad = first[: len(first) - len(first.lstrip(" "))]
+    shim = (
+        f"{pad}import os, sys\n"
+        f"{pad}sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+    )
+    lines.insert(lineno - 1, shim)
+    main_py.write_text("".join(lines), encoding="utf-8")
+    return True
 
 
 def _preprocess_needs_pg(source: Path) -> bool:
@@ -196,7 +333,7 @@ def _task_toml(task: str, servers: list[dict], *, has_db: bool) -> str:
 
             [[verifier.collect]]
             service = "main"
-            command = "PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py finalize"
+            command = "PYTHONPATH=/opt/cowork_lifecycle:/workspace /opt/venv/bin/python3 /opt/cowork_lifecycle/workspace_lifecycle.py finalize"
             timeout_sec = 60.0
 
             [agent]
@@ -206,7 +343,10 @@ def _task_toml(task: str, servers: list[dict], *, has_db: bool) -> str:
             docker_image = "{MAIN_IMAGE}"
             network_mode = "public"
             build_timeout_sec = 1800.0
-            workdir = "/workspace"
+            # The agent starts inside the shared workspace: the instruction
+            # names it (WORKSPACE_HINT) and graders read deliverables from
+            # there, so cwd and prompt must not disagree.
+            workdir = "/workspace/cowork_shared"
             cpus = 4
             memory_mb = 12288
             storage_mb = 20480
@@ -253,30 +393,67 @@ def _compose(
     has_db: bool,
     has_db_gw: bool | None = None,
     has_workspace: bool,
-    has_mock: bool,
+    mock_http: dict | None,
 ) -> str:
     if has_db_gw is None:
         has_db_gw = has_db
-    mock_vol = (
-        "      - ./task_payload/files/mock_pages.tar.gz:/mock/mock_pages.tar.gz:ro\n"
-        if has_mock
-        else ""
-    )
-    if has_mock:
+    mock_vol = f"      - {mock_http['volume']}\n" if mock_http else ""
+    mock_pages_service = ""
+    if mock_http:
+        extract = mock_http["extract"]
+        serve_port = mock_http["port"]
+        serve_directory = mock_http["directory"]
         mock_cmd = (
             "    command:\n"
             "      - bash\n"
             "      - -lc\n"
             "      - |\n"
             "        set -euo pipefail\n"
-            "        mkdir -p /tmp/mock\n"
-            "        tar -xzf /mock/mock_pages.tar.gz -C /tmp/mock\n"
-            "        python3 -m http.server 30151 --bind 127.0.0.1 "
-            "--directory /tmp/mock/mock_pages >/tmp/mock-http.log 2>&1 &\n"
+            "        mkdir -p /logs/artifacts/cowork\n"
+            "        rm -f /logs/artifacts/cowork/traj_log.json"
+            " /logs/artifacts/cowork/agent_completion.json"
+            " /logs/artifacts/cowork/eval_res.json"
+            " /logs/artifacts/cowork/eval_report.json\n"
+            "        PYTHONPATH=/opt/cowork_lifecycle /opt/venv/bin/python3 -c "
+            "\"import workspace_lifecycle as w; w.discard_public_completion()\"\n"
+            f"{extract}"
+            f"        python3 -m http.server {serve_port} --bind 127.0.0.1 "
+            f"--directory {serve_directory} >/tmp/mock-http.log 2>&1 &\n"
             "        exec sleep infinity\n"
         )
+        gateway_service = "mcp-gateway-workspace" if has_workspace else "mcp-gateway-public"
+        mock_pages_service = f"""
+  mock-pages:
+    image: "{MAIN_IMAGE}"
+    network_mode: "service:{gateway_service}"
+    volumes:
+      - {mock_http['volume']}
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+{extract}        exec python3 -m http.server {serve_port} --bind 127.0.0.1 --directory {serve_directory}
+    depends_on:
+      {gateway_service}:
+        condition: service_started
+"""
     else:
-        mock_cmd = "    command:\n      - sleep\n      - infinity\n"
+        mock_cmd = (
+            "    command:\n"
+            "      - bash\n"
+            "      - -lc\n"
+            "      - |\n"
+            "        set -euo pipefail\n"
+            "        mkdir -p /logs/artifacts/cowork\n"
+            "        rm -f /logs/artifacts/cowork/traj_log.json"
+            " /logs/artifacts/cowork/agent_completion.json"
+            " /logs/artifacts/cowork/eval_res.json"
+            " /logs/artifacts/cowork/eval_report.json\n"
+            "        PYTHONPATH=/opt/cowork_lifecycle /opt/venv/bin/python3 -c "
+            "\"import workspace_lifecycle as w; w.discard_public_completion()\"\n"
+            "        exec sleep infinity\n"
+        )
 
     prep_network = "db_net" if has_db else "agent_net"
     prep_env_file = "    env_file:\n      - ./pg.env\n" if has_db else ""
@@ -495,7 +672,8 @@ services:
       UV_VENV_CLEAR: "1"
     volumes:
       - cowork_workspace:{SHARED_WS}
-{grader_main_vols}{mock_vol}      - ./agent_opt_stub:/opt/harbor_native:ro
+{grader_main_vols}{mock_vol}      - ./lifecycle:/opt/cowork_lifecycle:ro
+      - ./agent_opt_stub:/opt/harbor_native:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: "2g"
@@ -558,14 +736,37 @@ services:
       start_period: 20s
     depends_on:
 {public_depends_s}
-
+{mock_pages_service}
 volumes:
   cowork_workspace:
 {volumes_extra}"""
 
 
-_CLASSIFIER_PYTHON_SCRIPT = r"""import sys, os, json
+_CLASSIFIER_PYTHON_SCRIPT = r"""import sys, os, json, re
 from datetime import datetime, timezone
+
+def _grader_stdout_lines(text):
+    start_mark = "== Evaluation STDOUT =="
+    end_mark = "== Evaluation STDERR =="
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == start_mark and start is None:
+            start = index + 1
+        elif start is not None and line.strip() == end_mark:
+            return lines[start:index]
+    return None
+
+def _pass_verdicts(lines):
+    if not lines:
+        return []
+    pattern = re.compile(r"^Pass:[ \t]+(True|False)[ \t]*$")
+    found = []
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            found.append(match.group(1))
+    return found
 
 mode = sys.argv[1]
 try:
@@ -652,6 +853,19 @@ if mode == "oracle":
         err_msg = f"Evaluator exited with rc={eval_rc} without checks output"
 elif mode == "ua":
     traj_missing = "Cowork traj_log.json not found" in combined
+    found = _pass_verdicts(_grader_stdout_lines(stdout_txt))
+    if len(found) == 1:
+        explicit_verdict = found[0]
+        verdict_problem = None
+    elif len(found) > 1 and len(set(found)) == 1:
+        explicit_verdict = None
+        verdict_problem = "duplicate"
+    elif len(found) > 1:
+        explicit_verdict = None
+        verdict_problem = "conflict"
+    else:
+        explicit_verdict = None
+        verdict_problem = "missing"
     if traj_missing:
         status = "failed"
         tech_status = "error"
@@ -661,32 +875,48 @@ elif mode == "ua":
         err_msg = "Cowork traj_log.json not found"
     else:
         eval_res_data = None
+        eval_res_corrupt = False
         if os.path.isfile(eval_res_path):
             try:
                 with open(eval_res_path, "r", encoding="utf-8") as f:
                     eval_res_data = json.load(f)
             except Exception:
-                pass
-        if isinstance(eval_res_data, dict) and eval_res_data.get("pass") is True:
+                eval_res_corrupt = True
+        pass_value = eval_res_data.get("pass") if isinstance(eval_res_data, dict) else None
+        content_pass = (
+            eval_rc == 0
+            and explicit_verdict == "True"
+            and not has_traceback
+            and not syntax_or_import
+            and pass_value is True
+        )
+        content_fail = (
+            eval_rc == 1
+            and explicit_verdict == "False"
+            and not has_traceback
+            and not syntax_or_import
+            and pass_value is False
+        )
+        if content_pass:
             status = "succeeded"
             tech_status = "completed"
             reward = 1
             eval_completed = True
             err_type = None
             err_msg = None
-        elif isinstance(eval_res_data, dict) and eval_res_data.get("pass") is False:
+        elif content_fail:
             status = "succeeded"
             tech_status = "completed"
             reward = 0
             eval_completed = True
             err_type = None
             err_msg = "Content evaluation failed"
-        elif has_traceback:
+        elif has_traceback or syntax_or_import:
             status = "failed"
             tech_status = "error"
             reward = 0
             eval_completed = False
-            err_type = "python_traceback"
+            err_type = "python_traceback" if has_traceback else "syntax_or_import_error"
             tb_lines = [l.strip() for l in combined.splitlines() if l.strip()]
             err_msg = tb_lines[-1] if tb_lines else "run_eval traceback"
         else:
@@ -694,8 +924,17 @@ elif mode == "ua":
             tech_status = "error"
             reward = 0
             eval_completed = False
-            err_type = "eval_contract_fail"
-            err_msg = f"Invalid eval_res.json (rc={eval_rc})"
+            err_type = "evaluator_failure"
+            if eval_res_corrupt:
+                err_msg = f"corrupt evaluator output (rc={eval_rc})"
+            elif verdict_problem == "duplicate":
+                err_msg = f"duplicate Pass verdict (rc={eval_rc})"
+            elif verdict_problem == "conflict":
+                err_msg = f"conflicting Pass verdict (rc={eval_rc})"
+            elif explicit_verdict is None:
+                err_msg = f"missing explicit Pass verdict (rc={eval_rc})"
+            else:
+                err_msg = f"evaluator rc={eval_rc} does not match verdict {explicit_verdict}"
 
 record = {
     "version": "2.0.6",
@@ -739,6 +978,7 @@ def _verifier(task: str, *, has_db: bool) -> str:
             TASK={task!r}
             ROOT=/workspace/tasks/finalpool/$TASK
             mkdir -p /logs/verifier "$ROOT"
+            cd "${{COWORK_EVAL_ROOT:-/workspace}}"
 
             HANDOFF_DIR=/grader_out
             COMPLETION="$HANDOFF_DIR/completion.json"
@@ -764,6 +1004,13 @@ def _verifier(task: str, *, has_db: bool) -> str:
               if [ -d /tests/groundtruth_workspace_cn ]; then
                 cp -a /tests/groundtruth_workspace_cn "$ROOT/groundtruth_workspace_cn"
               fi
+              # The agent image strips /workspace/tasks (isolation), so the
+              # rest of the task tree the graders read — files/, tmp/,
+              # initial_workspace/ — is reconstructed here just like
+              # evaluation/ and groundtruth, from the verifier-only /tests.
+              if [ -d /tests/task_data ]; then
+                cp -a /tests/task_data/. "$ROOT/"
+              fi
 
               ORACLE_WORKSPACE=/logs/artifacts/cowork/oracle_workspace
               if [ -f "$ORACLE_WORKSPACE/.oracle-ready" ]; then
@@ -778,18 +1025,36 @@ def _verifier(task: str, *, has_db: bool) -> str:
                 set -e
               else
                 MODE="ua"
-                LOG=$(/opt/venv/bin/python3 -c "import glob; p=sorted(glob.glob('/logs/artifacts/cowork/**/traj_log.json',recursive=True)); print(p[0] if p else '')")
-                if [ -z "$LOG" ]; then
+                CONTRACT=/tests/grader_private/task_contract.json
+                PUBLIC=/logs/artifacts/cowork/agent_completion.json
+                LOG=/logs/artifacts/cowork/traj_log.json
+                rm -f "$LOG"
+                if [ ! -f "$CONTRACT" ] || [ ! -f "$PUBLIC" ]; then
                   printf '%s\n' "Cowork traj_log.json not found" >"$EVAL_STDERR"
                   : >"$EVAL_STDOUT"
                   EVAL_RC=2
                 else
-                  EVAL_RES="$(dirname "$LOG")/eval_res.json"
                   set +e
-                  PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
-                    --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
-                  EVAL_RC=$?
+                  PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py assemble \\
+                    --task "$TASK" --contract "$CONTRACT" --completion "$PUBLIC" --log "$LOG" \\
+                    >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+                  ASSEMBLE_RC=$?
                   set -e
+                  if [ "$ASSEMBLE_RC" -ne 0 ] || [ ! -f "$LOG" ]; then
+                    if [ ! -s "$EVAL_STDERR" ]; then
+                      printf '%s\n' "traj assemble failed" >"$EVAL_STDERR"
+                    fi
+                    EVAL_RC=2
+                  else
+                    EVAL_RES="$(dirname "$LOG")/eval_res.json"
+                    : >"$EVAL_STDOUT"
+                    : >"$EVAL_STDERR"
+                    set +e
+                    PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
+                      --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+                    EVAL_RC=$?
+                    set -e
+                  fi
                 fi
               fi
 
@@ -846,7 +1111,7 @@ PY
 
             if [ "$HANDOFF_STATUS" = "failed" ] || [ "$HANDOFF_TECH" = "error" ]; then
               echo "grader evaluator failed: error_type=$HANDOFF_ERR_TYPE message=$HANDOFF_ERR_MSG" >&2
-              echo 0 > /logs/verifier/reward.txt
+              rm -f /logs/verifier/reward.txt
               exit 2
             fi
 
@@ -869,13 +1134,10 @@ PY
         TASK={task!r}
         ROOT=/workspace/tasks/finalpool/$TASK
         mkdir -p /logs/verifier "$ROOT"
+        cd "${{COWORK_EVAL_ROOT:-/workspace}}"
 
-        # Lifecycle helpers arrive with Harbor's /tests upload (verifier phase only).
-        if [ -f /tests/verifier/workspace_lifecycle.py ] && [ -f {SHARED_WS}/.cowork/cli_context.json ]; then
-          PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py finalize \\
-            || true
-        fi
-
+        # Main already published the public completion record. /tests is mounted
+        # only for this verifier phase, after the agent has stopped.
         COMPLETION=/logs/verifier/completion.json
         REWARD_FILE=/logs/verifier/reward.txt
         EVAL_LOG=/logs/verifier/cowork-eval.log
@@ -896,6 +1158,13 @@ PY
         if [ -d /tests/groundtruth_workspace_cn ]; then
           cp -a /tests/groundtruth_workspace_cn "$ROOT/groundtruth_workspace_cn"
         fi
+        # The agent image strips /workspace/tasks (isolation), so the rest of
+        # the task tree the graders read — files/, tmp/, initial_workspace/ —
+        # is reconstructed here just like evaluation/ and groundtruth, from
+        # the verifier-only /tests.
+        if [ -d /tests/task_data ]; then
+          cp -a /tests/task_data/. "$ROOT/"
+        fi
 
         ORACLE_WORKSPACE=/logs/artifacts/cowork/oracle_workspace
         if [ -f "$ORACLE_WORKSPACE/.oracle-ready" ]; then
@@ -910,18 +1179,36 @@ PY
           set -e
         else
           MODE="ua"
-          LOG=$(/opt/venv/bin/python3 -c "import glob; p=sorted(glob.glob('/logs/artifacts/cowork/**/traj_log.json',recursive=True)); print(p[0] if p else '')")
-          if [ -z "$LOG" ]; then
+          CONTRACT=/tests/grader_private/task_contract.json
+          PUBLIC=/logs/artifacts/cowork/agent_completion.json
+          LOG=/logs/artifacts/cowork/traj_log.json
+          rm -f "$LOG"
+          if [ ! -f "$CONTRACT" ] || [ ! -f "$PUBLIC" ]; then
             printf '%s\n' "Cowork traj_log.json not found" >"$EVAL_STDERR"
             : >"$EVAL_STDOUT"
             EVAL_RC=2
           else
-            EVAL_RES="$(dirname "$LOG")/eval_res.json"
             set +e
-            PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
-              --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
-            EVAL_RC=$?
+            PYTHONPATH=/tests/verifier:/workspace /opt/venv/bin/python3 /tests/verifier/workspace_lifecycle.py assemble \\
+              --task "$TASK" --contract "$CONTRACT" --completion "$PUBLIC" --log "$LOG" \\
+              >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+            ASSEMBLE_RC=$?
             set -e
+            if [ "$ASSEMBLE_RC" -ne 0 ] || [ ! -f "$LOG" ]; then
+              if [ ! -s "$EVAL_STDERR" ]; then
+                printf '%s\n' "traj assemble failed" >"$EVAL_STDERR"
+              fi
+              EVAL_RC=2
+            else
+              EVAL_RES="$(dirname "$LOG")/eval_res.json"
+              : >"$EVAL_STDOUT"
+              : >"$EVAL_STDERR"
+              set +e
+              PYTHONPATH=/workspace /opt/venv/bin/python3 -u /workspace/scripts/run_eval.py \\
+                --log_file "$LOG" >"$EVAL_STDOUT" 2>"$EVAL_STDERR"
+              EVAL_RC=$?
+              set -e
+            fi
           fi
         fi
 
@@ -957,7 +1244,7 @@ PY
 
         if [ "$HANDOFF_STATUS" = "failed" ] || [ "$HANDOFF_TECH" = "error" ]; then
           echo "evaluator failed: error_type=$HANDOFF_ERR_TYPE message=$HANDOFF_ERR_MSG" >&2
-          echo 0 > /logs/verifier/reward.txt
+          rm -f "$REWARD_FILE"
           exit 2
         fi
 
@@ -995,19 +1282,33 @@ def _solve_sh(task: str) -> str:
         from datetime import datetime
         from pathlib import Path
         ws = Path({SHARED_WS!r})
+        task_config = {{
+          "task_dir": {task!r},
+          "id": {task!r},
+          "needed_mcp_servers": None,
+          "needed_local_tools": None,
+          "task_root": {task!r},
+          "task_str": "",
+          "log_file": "/logs/artifacts/cowork/traj_log.json",
+          "agent_workspace": str(ws),
+          "launch_time": "",
+          "max_turns": None,
+          "max_steps_under_single_turn_mode": None,
+          "single_turn_mode": True,
+          "cn_mode": False,
+          "system_prompts": {{"agent": None, "user": None}},
+          "initialization": {{"workspace": None, "process_command": None}},
+          "stop": {{"user_phrases": ["#### STOP"], "tool_names": ["local-claim_done"]}},
+          "evaluation": {{"groundtruth_workspace": None, "evaluation_command": None}},
+          "meta": {{}},
+          "local_token_key_session": None,
+        }}
         ctx = {{
-          "task": {task!r},
+          "task": task_config.get("task_dir"),
           "provider": "oracle",
           "model": "solve.sh",
           "workspace": str(ws),
           "log_file": "/logs/artifacts/cowork/traj_log.json",
-          "task_config": {{
-            "id": {task!r},
-            "task_dir": {task!r},
-            "agent_workspace": str(ws),
-            "log_file": "/logs/artifacts/cowork/traj_log.json",
-            "single_turn_mode": True,
-          }},
           "start_time": datetime.now().isoformat(),
         }}
         (ws / ".cowork").mkdir(parents=True, exist_ok=True)
@@ -1015,11 +1316,11 @@ def _solve_sh(task: str) -> str:
         Path("/logs/artifacts/cowork").mkdir(parents=True, exist_ok=True)
         Path("/logs/artifacts/cowork/traj_log.json").write_text(
           json.dumps({{
-            "config": ctx["task_config"],
+            "config": task_config,
             "status": "success",
             "start_time": ctx["start_time"],
             "end_time": datetime.now().isoformat(),
-            "completion": {{"confirmed": True, "reason": "oracle_solve_sh", "framework": "oracle", "evidence": ["solution/solve.sh"]}},
+            "completion": {{"confirmed": True, "reason": "oracle_solve_sh", "framework": "oracle", "evidence": ["solution/solve.sh"], "stop_reason": None}},
           }}, ensure_ascii=False, indent=2),
           encoding="utf-8",
         )
@@ -1046,6 +1347,59 @@ def _copy_payload(source: Path, dest: Path) -> None:
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
+
+
+def _render_pg_env(user: str, password: str, db: str) -> str:
+    """Same 13 keys, same order, as environment/generate_pg_env.sh emits."""
+    return (
+        f"POSTGRES_USER={user}\n"
+        f"POSTGRES_PASSWORD={password}\n"
+        f"POSTGRES_DB={db}\n"
+        f"PGUSER={user}\n"
+        f"PG_USER={user}\n"
+        f"PGPASSWORD={password}\n"
+        f"PG_PASSWORD={password}\n"
+        f"PGDATABASE={db}\n"
+        f"PG_DATABASE={db}\n"
+        "PGHOST=postgres\n"
+        "PG_HOST=postgres\n"
+        "PGPORT=5432\n"
+        "PG_PORT=5432\n"
+    )
+
+
+def _read_existing_pg_env(root: Path) -> dict | None:
+    """First populated environment/pg.env in a previously generated tree."""
+    for path in sorted(root.glob("*/environment/pg.env")):
+        data = {}
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, _, value = line.partition("=")
+                data[key.strip()] = value.strip()
+        if data.get("POSTGRES_PASSWORD"):
+            return data
+    return None
+
+
+def _resolve_pg_credentials(
+    output_root: Path, args: "argparse.Namespace"
+) -> tuple[str, str, str, str]:
+    """One credential set for the whole dataset.
+
+    Priority: --pg-password → reuse a populated pg.env already in the output
+    tree → generate a fresh random secret. Returns (user, password, db, source).
+    """
+    if args.pg_password:
+        return args.pg_user, args.pg_password, args.pg_db, "supplied"
+    existing = _read_existing_pg_env(output_root)
+    if existing:
+        return (
+            existing.get("POSTGRES_USER") or args.pg_user,
+            existing["POSTGRES_PASSWORD"],
+            existing.get("POSTGRES_DB") or args.pg_db,
+            "reused",
+        )
+    return args.pg_user, secrets.token_urlsafe(32), args.pg_db, "generated"
 
 
 def _pg_env_example() -> str:
@@ -1098,7 +1452,12 @@ def _generate_pg_env_sh() -> str:
     )
 
 
-def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
+def convert_one(
+    task: str,
+    output_root: Path,
+    catalog: dict,
+    pg_content: str = "",
+) -> dict:
     """Convert one Cowork task to canonical Harbor packaging."""
     source = SOURCE_TASKS / task
     if not (source / "task_config.json").is_file():
@@ -1115,7 +1474,6 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     has_workspace = bool(ws_servers)
     if not has_db and not has_workspace:
         has_workspace = True
-    has_mock = _has_mock_http(source)
     has_gt = (
         _usable_groundtruth(source)
         and task not in NO_GROUNDTRUTH
@@ -1129,6 +1487,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     (env_dir / "mcp_runtime").mkdir(parents=True)
     (env_dir / "prep").mkdir(parents=True)
     (env_dir / "agent_opt_stub").mkdir(parents=True)
+    (env_dir / "lifecycle").mkdir(parents=True)
     (env_dir / "task_payload").mkdir(parents=True)
     (target / "tests" / "verifier").mkdir(parents=True)
     (target / "solution").mkdir(parents=True)
@@ -1137,6 +1496,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         encoding="utf-8"
     ).rstrip() + "\n"
     instruction = instruction + WORKSPACE_HINT
+    mock_http = _mock_http_spec(source, instruction)
     for banned in (
         "TURN_FINISHED",
         "turn_finish",
@@ -1160,7 +1520,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
             has_db=has_db,
             has_db_gw=has_db_gw,
             has_workspace=has_workspace,
-            has_mock=has_mock,
+            mock_http=mock_http,
         ),
         encoding="utf-8",
     )
@@ -1214,9 +1574,15 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     )
 
     if has_db:
-        # Docker Compose requires env_file to exist even when it is empty.
-        # Runtime credentials are injected separately and never packaged.
-        (env_dir / "pg.env").write_bytes(b"")
+        # Docker Compose requires env_file to exist. The packaged pg.env carries
+        # the real per-dataset credentials: postgres (POSTGRES_*) seeds its user
+        # from it, prep / mcp-gateway-db / grader connect with it. The AGENT
+        # (main service) has no env_file and no mount of environment/pg.env, so
+        # the file is present in the package but invisible to the agent.
+        # Direct convert_one callers (tests) may omit credentials — the file
+        # then stays empty like the pre-patch packaging, and main() passes the
+        # resolved per-dataset content instead.
+        (env_dir / "pg.env").write_text(pg_content, encoding="utf-8")
         (env_dir / "pg.env.example").write_text(_pg_env_example(), encoding="utf-8")
         gen = env_dir / "generate_pg_env.sh"
         gen.write_text(_generate_pg_env_sh(), encoding="utf-8")
@@ -1225,7 +1591,9 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
 
     (env_dir / "agent_opt_stub" / "README.md").write_text(
         "Stub mount for /opt/harbor_native on main.\n"
-        "Lifecycle lives under tests/verifier only — not agent-visible.\n",
+        "The main finalize hook mounts only workspace_lifecycle.py and\n"
+        "completion.py at /opt/cowork_lifecycle. Evaluation paths are not\n"
+        "written before the agent stops.\n",
         encoding="utf-8",
     )
     shutil.copy2(PREP_SRC, env_dir / "prep" / "prepare_workspace.py")
@@ -1242,6 +1610,24 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     _rewrite_evaluation_db_secrets(target / "tests" / "evaluation")
+    grader_import_shim = _ensure_sibling_import_shim(
+        target / "tests" / "evaluation" / "main.py"
+    )
+
+    # Verdict prints are a packaging artifact: the grader must print exactly one
+    # "Pass: True/False" line per content exit (utils/evaluation/verdict.py
+    # contract), while the finalpool sources stay in the authors' original form.
+    eval_main = target / "tests" / "evaluation" / "main.py"
+    verdict_source = eval_main.read_text(encoding="utf-8")
+    verdict_plan = analyze_source(task, eval_main, verdict_source)
+    if verdict_plan.unresolved:
+        unresolved = [s.source for s in verdict_plan.sites if s.action == "unresolved"]
+        raise ValueError(f"{task}: grader verdict contract unresolved at {unresolved}")
+    verdict_prints_inserted = not is_applied(verdict_plan, verdict_source)
+    if verdict_prints_inserted:
+        eval_main.write_text(
+            apply_plan(verdict_plan, verdict_source), encoding="utf-8"
+        )
     for dirname in ("groundtruth_workspace", "groundtruth_workspace_cn"):
         src = source / dirname
         if src.exists():
@@ -1250,8 +1636,39 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
                 target / "tests" / dirname,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    # Grader-side task data (files/, tmp/, initial_workspace/): graders open
+    # these from $ROOT at verifier time, but the agent image strips
+    # /workspace/tasks (isolation) and test.sh reconstructs only evaluation/
+    # and groundtruth. Ship the data under tests/ so it rides the same
+    # verifier-only mount in both grading paths (db sidecar /tests, no-db
+    # main staging) and stays invisible to the agent.
+    grader_task_data: list[str] = []
+    for name in ("files", "tmp", "initial_workspace"):
+        src = source / name
+        if src.is_dir():
+            shutil.copytree(
+                src,
+                target / "tests" / "task_data" / name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            grader_task_data.append(name)
     for name in ("workspace_lifecycle.py", "completion.py"):
+        shutil.copy2(NATIVE_DIR / name, env_dir / "lifecycle" / name)
         shutil.copy2(NATIVE_DIR / name, target / "tests" / "verifier" / name)
+    shutil.copy2(NATIVE_DIR / "verifier_shell.py", target / "tests" / "verifier" / "verifier_shell.py")
+    from native_mcp.verifier_shell import sanitized_task_config
+
+    contract = sanitized_task_config(
+        task,
+        agent_workspace=SHARED_WS,
+        log_file="/logs/artifacts/cowork/traj_log.json",
+    )
+    private_dir = target / "tests" / "grader_private"
+    private_dir.mkdir(parents=True, exist_ok=True)
+    (private_dir / "task_contract.json").write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     _copy_payload(source, env_dir / "task_payload")
     preprocess_dir = env_dir / "task_payload" / "preprocess"
@@ -1283,7 +1700,7 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         or "clickhouse" in task,
         "hr1c": "hr1c" in mcp_names or "hr1c" in task,
         "multi_workspace": len(ws_servers) >= 2,
-        "has_mock_http": has_mock,
+        "has_mock_http": mock_http is not None,
     }
     summary = {
         "source_task": task,
@@ -1310,6 +1727,11 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
             "mcp-gateway-public",
         ],
         "workspace": SHARED_WS,
+        "grader_task_data": grader_task_data,
+        "grader_import_shim": grader_import_shim,
+        "grader_verdict_sites": len(verdict_plan.sites),
+        "grader_verdict_class": verdict_plan.change_class,
+        "grader_verdict_prints_inserted": verdict_prints_inserted,
         **flags,
     }
     (target / "metadata.json").write_text(
@@ -1336,6 +1758,14 @@ def main() -> int:
     parser.add_argument("--main-image", default=MAIN_IMAGE)
     parser.add_argument("--postgres-image", default=POSTGRES_IMAGE)
     parser.add_argument("--source-tasks", type=Path, default=None)
+    parser.add_argument("--pg-user", default="eigent")
+    parser.add_argument("--pg-db", default="cowork_gym")
+    parser.add_argument(
+        "--pg-password",
+        default=None,
+        help="pin one PostgreSQL password for the dataset "
+        "(default: reuse a populated pg.env in the output tree, else generate)",
+    )
     args = parser.parse_args()
     MAIN_IMAGE = args.main_image
     POSTGRES_IMAGE = args.postgres_image
@@ -1355,11 +1785,15 @@ def main() -> int:
         ids = all_task_ids()
 
     args.output.mkdir(parents=True, exist_ok=True)
+    pg_user, pg_password, pg_db, pg_source = _resolve_pg_credentials(args.output, args)
+    pg_content = _render_pg_env(pg_user, pg_password, pg_db)
+    print(f"pg.env: user={pg_user} db={pg_db} password {pg_source} ({len(pg_password)} chars)")
+
     index: list[dict] = []
     errors: list[str] = []
     for task in ids:
         try:
-            index.append(convert_one(task, args.output, catalog))
+            index.append(convert_one(task, args.output, catalog, pg_content=pg_content))
             print(f"OK {task}")
         except Exception as exc:
             errors.append(f"{task}: {exc}")
